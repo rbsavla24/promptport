@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PromptPort</title>
+  <style>
+    :root { --ink:#1a1a1a; --graphite:#4d4d4d; --steel:#6e6e6e; --ash:#cfcfcf; --mist:#ececec; --paper:#f7f7f7;
+      --sk:255px 14px 225px 14px/14px 225px 14px 255px; --sk2:14px 225px 14px 255px/255px 14px 225px 14px; }
+    body { width: 300px; margin: 0; font-family: Verdana, Geneva, "DejaVu Sans", sans-serif; color: var(--ink); background: #fff; font-size: 13px; }
+    header { display: flex; align-items: center; gap: 8px; padding: 12px 14px 10px; border-bottom: 2px dashed var(--ash); font-weight: bold; font-size: 14px; }
+    main { padding: 12px 14px 14px; }
+    #status { font-size: 12px; color: var(--graphite); line-height: 1.5; margin-bottom: 10px; }
+    ul { list-style: none; padding: 0; margin: 0 0 12px; }
+    li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 2px dotted var(--ash); font-size: 12.5px; font-weight: bold; }
+    li:last-child { border-bottom: none; }
+    li .dot { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; flex: none; box-sizing: border-box; }
+    li .dot.ok { background: var(--ink); color: #fff; }
+    li .dot.no { border: 2px dashed var(--steel); color: var(--graphite); }
+    li .meta { margin-left: auto; color: var(--steel); font-size: 11px; font-weight: normal; }
+    .btns { display: flex; gap: 10px; }
+    button { flex: 1 1 0; min-height: 40px; padding: 8px; border: 2px solid var(--ink); border-radius: var(--sk); font: bold 12.5px Verdana, Geneva, "DejaVu Sans", sans-serif; cursor: pointer; }
+    button + button { border-radius: var(--sk2); }
+    button[hidden] { display: none; }
+    #dl { background: var(--ink); color: #fff; box-shadow: 3px 3px 0 var(--steel); }
+    #panel { background: #fff; color: var(--ink); }
+    #dl:disabled, #panel:disabled { background: #fff repeating-linear-gradient(-45deg, var(--mist) 0 2px, transparent 2px 8px); color: var(--graphite); border-style: dashed; border-color: var(--steel); box-shadow: none; cursor: default; }
+    button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+    .hint { font-size: 11px; color: var(--steel); margin-top: 10px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 1l2 6 6 2-6 2-2 6-2-6-6-2 6-2z" fill="#ececec" stroke="#1a1a1a" stroke-width="1.4" stroke-linejoin="round"/></svg>
+    PromptPort
+  </header>
+  <main>
+    <div id="status" role="status">Checking page…</div>
+    <ul id="list"></ul>
+    <div class="btns">
+      <button id="dl">Open on page</button>
+      <button id="panel" hidden>Show on page</button>
+    </div>
+    <div class="hint">The download happens in the panel on the page: it copies each section with a real click (needed for an exact copy) and opens collapsed sections first.</div>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

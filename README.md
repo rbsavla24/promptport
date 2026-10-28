@@ -102,9 +102,10 @@ flowchart LR
 
 PromptPort is a standard Chrome (Manifest V3) extension. It should also load in other Chromium browsers such as Edge and Brave (tested on Chrome).
 
-1. Download the latest ZIP from [**Releases**](../../releases) and unzip it into a folder you'll keep.
+1. Download `PromptPort-v3.2.4.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
+   *(Or clone this repository and use the `extension` folder.)*
 2. Open `chrome://extensions` and switch on **Developer mode** (top right).
-3. Click **Load unpacked** and select the unzipped folder.
+3. Click **Load unpacked** and select the unzipped folder (the one containing `manifest.json`).
 4. Open an assistant on Ringg AI or a voice agent's Prompt tab on Rezolv.AI. The PromptPort button appears in the bottom-right corner.
 
 > **Work laptop with managed extensions?** Ask your IT admin to allow the extension. The [permissions](#permissions) section below is written for them.
