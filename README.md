@@ -15,7 +15,9 @@ Back up a bot in one click. Move a prompt between assistants or between platform
 
 </div>
 
-<!-- Tip: add a screenshot or short GIF of the panel here, e.g. ![PromptPort panel](docs/panel.png) -->
+<p align="center">
+  <img src="docs/promptport-hero.png" alt="The PromptPort panel: export in one click, review every change before import, undo anytime, and find &amp; replace across the whole bot" width="100%">
+</p>
 
 ---
 
