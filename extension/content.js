@@ -12,6 +12,8 @@
   var NS = "RINGG_MD_EXPORTER";
   var latestAssistant = null; // { url, data } — used mainly for naming
   var captured = [];          // all captured JSON payloads (data objects)
+  var capturedMeta = [];      // same payloads tagged with their source URL (for
+                              // URL-based filtering, e.g. assistant-level tools)
   var _lastBackup = null;     // { when, sections, matched, importedKeys } — pre-import snapshot for Undo
 
   var opGen = 0;              // bumped each openPanel/refresh; stale chains bail
@@ -29,14 +31,19 @@
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       captured = [];
+      capturedMeta = [];
       latestAssistant = null;
     }
   }
 
-  function addCapture(data) {
+  function addCapture(data, url) {
     if (!data || typeof data !== "object") return;
-    if (captured.indexOf(data) === -1) captured.push(data);
+    if (captured.indexOf(data) === -1) {
+      captured.push(data);
+      capturedMeta.push({ url: url || "", data: data });
+    }
     if (captured.length > 40) captured.shift();
+    if (capturedMeta.length > 40) capturedMeta.shift();
   }
 
   // ---- talk to the page-world interceptor ---------------------------------
@@ -46,10 +53,10 @@
     if (!msg || msg.__ns !== NS) return;
     if (msg.type === "assistant-data") {
       latestAssistant = msg.payload;
-      addCapture(msg.payload && msg.payload.data);
+      addCapture(msg.payload && msg.payload.data, msg.payload && msg.payload.url);
     } else if (msg.type === "captures") {
       var list = (msg.payload && msg.payload.list) || [];
-      list.forEach(function (c) { addCapture(c && c.data); });
+      list.forEach(function (c) { addCapture(c && c.data, c && c.url); });
     }
   });
 
@@ -485,11 +492,50 @@
       fileBase(nameFromUI() || assistantName()) + " (2-bucket).zip");
   }
 
+  // ---- Magic Port export: full bot (prompt + all configs) as one ZIP -------
+  // Prompt travels as the usual .md files (5 on Ringg, 2 on Rezolv); the other
+  // five data points go in magicport.json, read from the captured API JSON by
+  // the MagicPort engine. REQ-1 (all variables) and REQ-2 (key types) are
+  // enforced in that engine.
+  function magicPortPromptFiles(sections) {
+    return isGorezolv() ? sectionsToTwoFiles(sections) : sectionsToFiles(sections);
+  }
+  function buildMagicPortFiles(sections) {
+    if (!window.MagicPort) return null;
+    resetIfNavigated();
+    var captures = captured.length ? captured
+                 : (latestAssistant && latestAssistant.data ? [latestAssistant.data] : []);
+    var promptFiles = magicPortPromptFiles(sections);
+    var built = window.MagicPort.buildConfig({
+      platform: window.MagicPort.hostPlatform(),
+      captures: captures,
+      captureMeta: capturedMeta,   // url-tagged, for assistant-level tool filtering
+      promptFiles: promptFiles,
+      pluginVersion: "4.0.0"
+    });
+    if (!built || !built.ok) return { ok: false, reason: (built && built.reason) || "no source data" };
+    return { ok: true, files: window.MagicPort.buildZipFiles(built.config, promptFiles), config: built.config };
+  }
+  function downloadMagicPort(sections) {
+    var r = buildMagicPortFiles(sections);
+    if (!r || !r.ok) { toast("Magic Port: " + ((r && r.reason) || "couldn't read this bot") + " — reload the bot and try again."); return false; }
+    var fname = fileBase(nameFromUI() || assistantName()) + " (Magic Port).zip";
+    saveZip(r.files, fname);
+    var n = (r.config.data.variables || []).length;
+    toast("Magic Port ZIP downloaded — " + n + " variables + configs" +
+      (r.config.containsCredentials ? " (contains credentials)" : ""));
+    _lastDl = "Magic Port ZIP downloaded."; setLinks(true);
+    return true;
+  }
+
   // ========================================================================
   //  Rezolv Voicebot Panel (panels.gorezolv.com/voicebot) — export support
   // ========================================================================
   function isGorezolv() {
-    return /(^|\.)panels\.gorezolv\.com$/i.test(location.hostname || "");
+    // Rezolv Voicebot Panel: production (panels.gorezolv.com) and QA/dev
+    // (panels.qa.devrezolv.com and other *.devrezolv.com hosts).
+    var h = location.hostname || "";
+    return /(^|\.)panels\.gorezolv\.com$/i.test(h) || /devrezolv\.com$/i.test(h);
   }
 
   // The panel's Prompt tab has two TipTap editors, each right after an <h3>
@@ -665,6 +711,9 @@
   // One place that performs a download in either format, on either site.
   function doDownload(format, sections) {
     var secs = (sections && sections.length) ? sections : fallbackSections();
+    if (format === "magic") {
+      return downloadMagicPort(secs);
+    }
     if (format === "two") {
       downloadZipTwo(secs);
       toast("2-bucket ZIP downloaded — First Message + Main Prompt");
@@ -2648,8 +2697,14 @@
     }
     var name = (file.name || "").toLowerCase();
     if (/\.zip$/.test(name)) {
-      file.arrayBuffer().then(readZipSource).then(beginImport)
-        .catch(function (err) { renderImportPlan({ error: (err && err.message) || "Could not read the zip." }, null); });
+      file.arrayBuffer().then(function (buf) {
+        // Magic Port zip? (contains magicport.json) -> full-bot migration.
+        return peekMagicPort(buf).then(function (mp) {
+          if (mp) { renderMagicPortConfirm(mp.config, buf); return; }
+          // otherwise the existing prompt-only import
+          return readZipSource(buf).then(beginImport);
+        });
+      }).catch(function (err) { renderImportPlan({ error: (err && err.message) || "Could not read the zip." }, null); });
     } else {
       var rd = file.text ? file.text() : new Promise(function (res, rej) {
         var fr = new FileReader(); fr.onload = function () { res(fr.result); }; fr.onerror = rej; fr.readAsText(file);
@@ -2659,6 +2714,268 @@
         beginImport(sourceFromMd(txt, file.name));
       }).catch(function () { renderImportPlan({ error: "Couldn't read the file." }, null); });
     }
+  }
+
+  // ---- Magic Port import (full-bot migration) -----------------------------
+  // Peek a zip for magicport.json; return {config, names} or null.
+  async function peekMagicPort(arrayBuffer) {
+    if (!window.MagicPort) return null;
+    var entries;
+    try { entries = await window.RinggUnzip.read(arrayBuffer); } catch (e) { return null; }
+    var names = [].map.call(entries, function (f) { return f.name; });
+    if (!window.MagicPort.isMagicPortZip(names)) return null;
+    var cfgEntry = [].slice.call(entries).filter(function (f) { return /(^|\/)magicport\.json$/i.test(f.name); })[0];
+    if (!cfgEntry) return null;
+    var config;
+    try { config = JSON.parse(cfgEntry.text); } catch (e) { return null; }
+    return { config: config, names: names };
+  }
+
+  // A red consent block (checkbox + message). Returns { wrap, checkbox }.
+  function mpConsentBlock(innerHtml) {
+    var wrap = el("div", "rs-mp-consent");
+    wrap.setAttribute("style", "display:flex;gap:10px;align-items:flex-start;margin-top:12px;padding:12px;border:1.5px solid #b91c1c;border-radius:10px;background:rgba(185,28,28,0.06);");
+    var cb = document.createElement("input");
+    cb.type = "checkbox"; cb.className = "rs-mp-consent-cb";
+    cb.setAttribute("style", "margin-top:2px;width:16px;height:16px;flex:0 0 auto;cursor:pointer;");
+    var txt = el("label", "rs-mp-consent-text");
+    txt.setAttribute("style", "font-size:12.5px;line-height:1.45;cursor:pointer;");
+    txt.innerHTML = innerHtml;
+    var id = "rs-mp-consent-" + Date.now() + "-" + Math.floor(Math.random() * 1e4);
+    cb.id = id; txt.setAttribute("for", id);
+    wrap.appendChild(cb); wrap.appendChild(txt);
+    return { wrap: wrap, checkbox: cb };
+  }
+
+  // Wire a button so it's gated by a consent checkbox: looks disabled until
+  // checked; a click while unchecked wiggles the consent block.
+  function mpWireConsentGate(consentEl, checkbox, btn, proceedFn) {
+    function sync() {
+      var on = checkbox.checked;
+      btn.setAttribute("aria-disabled", on ? "false" : "true");
+      btn.style.opacity = on ? "" : "0.45";
+      btn.style.cursor = on ? "" : "not-allowed";
+    }
+    function wiggle(node) {
+      try {
+        node.animate(
+          [{ transform: "translateX(0)" }, { transform: "translateX(-7px)" }, { transform: "translateX(7px)" },
+           { transform: "translateX(-5px)" }, { transform: "translateX(5px)" }, { transform: "translateX(0)" }],
+          { duration: 420, easing: "ease-in-out" });
+        var ob = node.style.borderColor; node.style.borderColor = "#ef4444";
+        setTimeout(function () { node.style.borderColor = ob || "#b91c1c"; }, 500);
+      } catch (e) {}
+      try { node.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) {}
+    }
+    checkbox.addEventListener("change", sync); sync();
+    btn.addEventListener("click", function () {
+      if (!checkbox.checked) { wiggle(consentEl); try { checkbox.focus(); } catch (e) {} return; }
+      proceedFn();
+    });
+  }
+
+  // Summary + one-click "Migrate" confirmation before writing anything.
+  function renderMagicPortConfirm(config, arrayBuffer) {
+    ++opGen;
+    freshPanel("Magic Port — import");
+    var d = config.data || {};
+    var dest = window.MagicPort.hostPlatform();
+    var srcP = (config.source && config.source.platform) || "?";
+    panel.appendChild(callout("info", "Migrate a full bot onto this " + (dest === "rezolv" ? "Rezolv" : "Ringg") + " bot",
+      "Source: " + (config.source && config.source.botName ? config.source.botName : "(unnamed)") + " [" + srcP + "]."));
+    var ul = el("div", "rs-note");
+    function line(txt) { panel.appendChild(lineRow("•", null, txt)); }
+    line((d.variables || []).length + " custom variables");
+    line(((d.customAnalysis && d.customAnalysis.keys) || []).length + " custom-analysis keys" + (d.customAnalysis && d.customAnalysis.prompt ? " + analysis prompt" : ""));
+    line((d.events || []).length + " event subscription(s)");
+    var toolN = 0; ["pre_call", "on_call", "post_call"].forEach(function (p) { toolN += ((d.tools || {})[p] || []).length; });
+    line(toolN + " tool(s)");
+    line("prompt (" + ((d.promptFiles || []).length) + " file(s)) + language/voice");
+    if (config.containsCredentials) panel.appendChild(callout("warn", "Contains credentials", "Tool cURLs / webhook URLs may include keys or tokens; they'll be written as-is."));
+    // Tell the user up-front what the source bot HAS that won't be migrated
+    // (non-API tools: widgets/callback/whatsapp; 3rd+ languages). These are out
+    // of the Magic Port scope (API cURL tools + primary/secondary language).
+    var np = config.notPortable || {};
+    var npTools = (np.nonApiTools || []);
+    if (npTools.length) {
+      panel.appendChild(callout("info", "Won't be migrated (out of scope)",
+        "The source bot also has non-API/widget tools that Magic Port doesn't carry over: " +
+        npTools.map(function (t) { return (t.name || "tool") + " (" + (t.toolType || "non-API") + ")"; }).join(", ") +
+        ". Everything else above migrates normally."));
+    }
+    panel.appendChild(callout("info", "Order & safety", "Runs variables → tools → prompt → language/voice → analysis → events, saving each section, then a final page Save. A backup of this bot's prompt fields is taken first. If the session drops, it stops and reports where it got to."));
+
+    // ---- required consent (import OVERWRITES everything on this bot) --------
+    var c = mpConsentBlock(
+      "<b>This will change this bot.</b> Magic Port writes the imported bot's prompt, language/voice and analysis over this bot's, and <b>adds</b> its variables, tools and event subscriptions. Anything already here that the imported bot doesn't have is <b>left in place</b> — nothing is deleted — and the results screen lists what was left. Use a <b>blank bot</b> unless you mean to change this one. I understand and want to continue.");
+    panel.appendChild(c.wrap);
+
+    var foot = footer();
+    var row = el("div", "rs-ctas");
+    var go = el("button", "rs-btn rs-cta rs-cta-magic"); go.appendChild(el("span", "rs-cta-l", "Migrate"));
+    var cancel = el("button", "rs-btn rs-btn-ghost"); cancel.appendChild(el("span", null, "Cancel"));
+    mpWireConsentGate(c.wrap, c.checkbox, go, function () {
+      go.setAttribute("aria-disabled", "true"); go.style.opacity = "0.45"; go.style.cursor = "not-allowed";
+      runMagicPortImport(config, arrayBuffer);
+    });
+    cancel.addEventListener("click", function () { renderImportHome(); });
+    row.appendChild(go); row.appendChild(cancel);
+    foot.appendChild(row);
+  }
+
+  // Run the full import via the orchestrator; wire the prompt step to the
+  // existing prompt pipeline (resolveImportPlan -> runImport).
+  async function runMagicPortImport(config, arrayBuffer) {
+    freshPanel("Magic Port — migrating…");
+    var status = el("div", "rs-note", "Writing sections… do not navigate away.");
+    status.setAttribute("aria-live", "polite");
+    panel.appendChild(status);
+
+    // backup current prompt fields (reuse the existing undo snapshot)
+    try { _lastBackup = await snapshotBuckets(); } catch (e) {}
+
+    var ctx = {
+      importPrompt: async function () {
+        try {
+          var src = await readZipSource(arrayBuffer);
+          var cur = await runExclusive(collectSections);
+          var curMap = {}; (cur || []).forEach(function (c) { curMap[c.key] = c.text || ""; });
+          var plan = resolveImportPlan(src, curMap);
+          // First pass writes all buckets; then each bucket that didn't take is
+          // retried individually (up to 3 attempts total), and the rest proceed.
+          var results = await runImport(plan.matched);
+          var byTitle = {}; results.forEach(function (r) { byTitle[r.title] = r; });
+          var failed = [];
+          for (var i = 0; i < plan.matched.length; i++) {
+            var m = plan.matched[i];
+            var r0 = byTitle[m.sec.title];
+            var ok = !!(r0 && r0.ok);
+            for (var a = 1; a <= 2 && !ok; a++) { // 2 more tries → 3 total
+              try { var res = await runImport([m]); ok = !!(res[0] && res[0].ok); } catch (e) { ok = false; }
+              if (!ok) await sleep(250);
+            }
+            if (!ok) failed.push(m.sec.title);
+          }
+          return { section: "prompt", ok: failed.length === 0, failedItems: failed };
+        } catch (e) { return { section: "prompt", ok: false, reason: String(e) }; }
+      },
+      // Write markdown/plain text into a TipTap editor (e.g. the Custom Analysis
+      // System Prompt), reusing the proven paste path. Returns true on success.
+      pasteTipTap: async function (editorEl, text) {
+        try {
+          var html = mdToHydratedHtml(String(text || ""));
+          return await pasteHtmlIntoEditor(editorEl, html);
+        } catch (e) { return false; }
+      }
+    };
+
+    var out;
+    try { out = await window.MagicPortImport.run(config, window.MagicPort.hostPlatform(), ctx); }
+    catch (e) { out = { ok: false, results: [{ section: "run", ok: false, reason: String(e) }], notes: [] }; }
+
+    // Surface the export-time "not ported" notes (non-API tools, extra languages)
+    // on the results report too, so the final summary is complete.
+    out.notes = (out.notes || []).concat(config.notes || []);
+
+    renderMagicPortResults(out);
+  }
+
+  function renderMagicPortResults(out) {
+    freshPanel("Magic Port — results");
+    var results = (out && out.results) || [];
+    var okN = results.filter(function (r) { return r && r.ok; }).length;
+    var LABEL = { variables: "Custom Variables", tools: "Tools", prompt: "Prompt", languageVoice: "Language & Voice", analysis: "Custom Analysis", events: "Event Subscription", "final-save": "Final page Save" };
+
+    // Collect everything that failed (whole sections AND individual items that
+    // didn't make it after all retries).
+    var failures = []; // { section, items:[...] , why }
+    results.forEach(function (r) {
+      if (!r) return;
+      var title = LABEL[r.section] || r.section;
+      var items = (r.failedItems || []).concat(r.missing || []);
+      if (!r.ok || items.length) {
+        var why = r.reason === "auth-redirect" ? "session expired (logged out) — stopped here"
+                : (r.reason && /TODO@LIVE/.test(r.reason)) ? "not available in this build yet"
+                : (r.wrong && r.wrong.length) ? ("wrong type: " + r.wrong.map(function (w) { return w.name; }).join(", "))
+                : (items.length ? "" : (r.reason || "failed"));
+        var uniq = items.filter(function (v, idx) { return items.indexOf(v) === idx; });
+        failures.push({ title: title, items: uniq, why: why });
+      }
+    });
+    var anyFail = failures.length > 0;
+
+    // Happy path: everything imported → smiley + "Porting Successful", no consent.
+    if (!anyFail) {
+      var smiley = '<svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<circle cx="12" cy="12" r="9"></circle>' +
+        '<path d="M8 14.5a5 5 0 0 0 8 0"></path>' +
+        '<line x1="9" y1="9.5" x2="9" y2="10"></line>' +
+        '<line x1="15" y1="9.5" x2="15" y2="10"></line></svg>';
+      var wrap = el("div", "rs-mp-success");
+      wrap.setAttribute("style", "display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:22px 8px;");
+      var face = el("div"); face.innerHTML = smiley; wrap.appendChild(face);
+      wrap.appendChild(el("div", "rs-donehead-t", "Porting Successful"));
+      wrap.appendChild(el("div", "rs-donehead-s", "The whole bot was imported and saved."));
+      panel.appendChild(wrap);
+      appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
+      addCloseRow();
+      setLinks(true);
+      return;
+    }
+
+    var head = el("div", "rs-donehead");
+    head.innerHTML = anyFail ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42"') : IC.done;
+    var ht = el("div");
+    ht.appendChild(el("div", "rs-donehead-t", anyFail ? (okN ? "Migrated with failures" : "Migration did not complete") : "Migration complete"));
+    ht.appendChild(el("div", "rs-donehead-s", anyFail ? "Some items were NOT imported — review the list below." : "Everything was imported and saved."));
+    head.appendChild(ht); panel.appendChild(head);
+
+    // Per-section summary (✓ / ✕)
+    results.forEach(function (r) {
+      if (!r) return;
+      var title = LABEL[r.section] || r.section;
+      var nFail = (r.failedItems || []).length + (r.missing || []).length;
+      if (r.ok && !nFail) {
+        var meta = r.section === "variables" ? ((r.actual != null ? r.actual + " created" : "done"))
+                 : r.section === "analysis" ? ((r.count != null ? r.count + " keys" : "done"))
+                 : r.section === "events" ? ((r.created != null ? r.created + " created" : "done")) : "done";
+        panel.appendChild(lineRow("✓", null, title, meta));
+      } else {
+        panel.appendChild(lineRow("✕", null, title, null, nFail ? (nFail + " item(s) failed") : "failed"));
+      }
+    });
+
+    // Explicit failed-items block (what did NOT get imported).
+    if (anyFail) {
+      var fb = callout("bad", "Not imported", null);
+      var list = el("div"); list.setAttribute("style", "margin-top:4px;");
+      failures.forEach(function (f) {
+        var line = el("div"); line.setAttribute("style", "font-size:12.5px;line-height:1.5;");
+        var label = f.items.length ? (f.title + ": " + f.items.join(", ")) : (f.title + (f.why ? " — " + f.why : ""));
+        if (f.items.length && f.why) label += " (" + f.why + ")";
+        line.textContent = "• " + label;
+        list.appendChild(line);
+      });
+      fb.querySelector("div:last-child").appendChild(list);
+      panel.appendChild(fb);
+    }
+
+    (out && out.notes || []).forEach(function (n) { panel.appendChild(lineRow("!", null, n)); });
+    appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
+
+    // Close behaviour: if anything failed, DON'T let the user close until they
+    // acknowledge the failed list (consent-gated Close, same wiggle pattern).
+    if (anyFail) {
+      var c = mpConsentBlock("I have reviewed the items above that were <b>not imported</b> and understand they were left out. I'll handle them manually if needed.");
+      panel.appendChild(c.wrap);
+      var foot = footer();
+      var closeBtn = el("button", "rs-btn rs-cta"); closeBtn.appendChild(el("span", "rs-cta-l", "Close"));
+      mpWireConsentGate(c.wrap, c.checkbox, closeBtn, function () { closePanel(); });
+      foot.appendChild(closeBtn);
+    } else {
+      addCloseRow();
+    }
+    if (okN) setLinks(true);
   }
 
     // Opening the plugin lands on the Export tab in an IDLE state — it does NOT
@@ -2831,6 +3148,18 @@
     var twoBtn = mkDownloadBtn("Download 2 Buckets", gz ? "as on the page" : "First Message + Main Prompt", "two", true, "", IC.two);
     ctas.appendChild(fiveBtn); ctas.appendChild(twoBtn);
     foot.appendChild(ctas);
+
+    // Magic Port: the third export CTA (full-width), downloads the whole bot
+    // (prompt + all configurations) as one ZIP for migration to another bot.
+    if (window.MagicPort) {
+      var mpBtn = el("button", "rs-btn rs-cta rs-cta-magic");
+      mpBtn.appendChild(el("span", "rs-cta-l", enabled ? "Magic Port" : "Preparing…"));
+      mpBtn.setAttribute("data-sub", enabled ? "full bot: prompt + configs" : "");
+      mpBtn.disabled = !enabled;
+      mpBtn.title = "Download the entire bot (prompt, variables, language/voice, analysis, tools, event subscriptions) as one ZIP to import onto another bot.";
+      mpBtn.addEventListener("click", function () { if (!mpBtn.disabled) refreshExport("magic"); });
+      foot.appendChild(mpBtn);
+    }
     // Remember the idle 5-bucket button so typing in Main Prompt can re-enable it.
     UI.fiveBtn = (gz && enabled) ? fiveBtn : null;
 

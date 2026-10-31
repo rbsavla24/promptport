@@ -586,8 +586,9 @@
   // Clicks open any of the 5 content buckets that are collapsed. Returns how
   // many it clicked so the caller can wait for content to render before copying.
   function expandCollapsed() {
-    // Ringg-only: never click toggles on the Rezolv Voicebot Panel.
-    if (/(^|\.)panels\.gorezolv\.com$/i.test(location.hostname || "")) return 0;
+    // Ringg-only: never click toggles on the Rezolv Voicebot Panel (prod or QA/dev).
+    if (/(^|\.)panels\.gorezolv\.com$/i.test(location.hostname || "") ||
+        /devrezolv\.com$/i.test(location.hostname || "")) return 0;
     var headers = SECTIONS.map(headerFor);
     var clicked = 0;
 
