@@ -2,9 +2,18 @@
   "manifest_version": 3,
   "name": "PromptPort",
   "version": "4.0.0",
-  "description": "Export and import voice-bot prompts as markdown ZIPs (5 buckets or 2 buckets), plus Magic Port — migrate a full bot (prompt + configurations) between Ringg and Rezolv.",
-  "permissions": ["activeTab", "scripting", "clipboardRead", "clipboardWrite"],
-  "host_permissions": ["*://*.ringg.ai/*", "*://panels.gorezolv.com/*", "*://panels.qa.devrezolv.com/*"],
+  "description": "Export and import voice-bot prompts as markdown ZIPs (5 buckets or 2 buckets), plus Magic Port — migrate a full bot (prompt + configurations) from a 5-field dashboard to a 2-field dashboard.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "*://*.ringg.ai/*",
+    "*://panels.gorezolv.com/*",
+    "*://panels.qa.devrezolv.com/*"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "PromptPort"
@@ -16,20 +25,55 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.ringg.ai/*", "*://panels.gorezolv.com/*", "*://panels.qa.devrezolv.com/*"],
-      "js": ["interceptor.js"],
+      "matches": [
+        "*://*.ringg.ai/*",
+        "*://panels.gorezolv.com/*",
+        "*://panels.qa.devrezolv.com/*"
+      ],
+      "js": [
+        "interceptor.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["*://*.ringg.ai/*"],
-      "js": ["zip.js", "unzip.js", "turndown.js", "turndown-plugin-gfm.js", "marked.min.js", "extract.js", "magicport-dom.js", "magicport.js", "magicport-import.js", "content.js"],
+      "matches": [
+        "*://*.ringg.ai/*"
+      ],
+      "js": [
+        "host.js",
+        "zip.js",
+        "unzip.js",
+        "turndown.js",
+        "turndown-plugin-gfm.js",
+        "marked.min.js",
+        "extract.js",
+        "magicport-dom.js",
+        "magicport.js",
+        "magicport-import.js",
+        "content.js"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED"
     },
     {
-      "matches": ["*://panels.gorezolv.com/voicebot/*", "*://panels.qa.devrezolv.com/voicebot/*"],
-      "js": ["zip.js", "unzip.js", "turndown.js", "turndown-plugin-gfm.js", "marked.min.js", "extract.js", "magicport-dom.js", "magicport.js", "magicport-import.js", "content.js"],
+      "matches": [
+        "*://panels.gorezolv.com/voicebot/*",
+        "*://panels.qa.devrezolv.com/voicebot/*"
+      ],
+      "js": [
+        "host.js",
+        "zip.js",
+        "unzip.js",
+        "turndown.js",
+        "turndown-plugin-gfm.js",
+        "marked.min.js",
+        "extract.js",
+        "magicport-dom.js",
+        "magicport.js",
+        "magicport-import.js",
+        "content.js"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

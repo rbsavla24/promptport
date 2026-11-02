@@ -9,7 +9,7 @@
 (function () {
   "use strict";
 
-  var NS = "RINGG_MD_EXPORTER";
+  var NS = "PROMPTPORT_BRIDGE";
   var latestAssistant = null; // { url, data } — used mainly for naming
   var captured = [];          // all captured JSON payloads (data objects)
   var capturedMeta = [];      // same payloads tagged with their source URL (for
@@ -91,7 +91,7 @@
   }
 
   // Known top-nav / workspace labels that are NEVER an assistant's name — used to
-  // reject breadcrumb/nav fragments (Ringg runs the nav items together, e.g.
+  // reject breadcrumb/nav fragments (Dash5 runs the nav items together, e.g.
   // "AssistantsWorkflows", so old "text after Assistants" heuristics grabbed
   // "Workflows"). Keep this list broad.
   var NAV_WORDS = /^(workflows?|monitor|logs?|campaigns?|analytics|evals?|alerts?|inventory|knowledge base|numbers?|integrations?|labs?|stt|settings|report a bug|search|assistants?)$/i;
@@ -108,9 +108,9 @@
     }
     var chosen = "";
 
-    // Rezolv Voicebot Panel: the name is the value of the input under the
+    // 2-field dashboard: the name is the value of the input under the
     // floating "Agent Name" label.
-    if (isGorezolv()) {
+    if (isTwoField()) {
       try {
         var lab = [].slice.call(document.querySelectorAll("label")).filter(function (l) {
           return clean(l.textContent) === "Agent Name";
@@ -200,11 +200,16 @@
 
     // 4) Page <title>.
     if (!chosen) {
-      var dt = (document.title || "").replace(/\s*[|·–—-]\s*ringg.*$/i, "").trim();
-      if (dt && dt.length > 3 && !/^ringg/i.test(dt) && !/voice assistants for business/i.test(dt)) chosen = dt;
+      // Drop the site's own name from the title (taken from this page's domain,
+      // e.g. "… | Brand" on brand.example), so it never becomes the bot name.
+      var brand = ((location.hostname || "").split(".").slice(-2)[0] || "").replace(/[^a-z0-9]/gi, "");
+      var dt = (document.title || "");
+      if (brand) dt = dt.replace(new RegExp("\\s*[|·–—-]\\s*" + brand + ".*$", "i"), "");
+      dt = dt.trim();
+      if (dt && dt.length > 3 && !(brand && new RegExp("^" + brand, "i").test(dt)) && !/voice assistants for business/i.test(dt)) chosen = dt;
     }
 
-    try { console.log("[Ringg MD] chosen name:", chosen); } catch (e) {}
+    try { console.log("[PromptPort] chosen name:", chosen); } catch (e) {}
     return chosen;
   }
 
@@ -218,7 +223,7 @@
 
   function zipFilename() {
     var name = nameFromUI() || assistantName();
-    try { console.log("%c[Ringg MD] zip filename:", "color:#4f46e5", fileBase(name) + ".zip"); } catch (e) {}
+    try { console.log("%c[PromptPort] zip filename:", "color:#4f46e5", fileBase(name) + ".zip"); } catch (e) {}
     return fileBase(name) + ".zip";
   }
 
@@ -228,7 +233,7 @@
     // the {{tokens}}); DOM is used only as a fallback inside combine().
     var input = captured.length ? captured
               : (latestAssistant && latestAssistant.data ? [latestAssistant.data] : []);
-    return window.RinggExtract.combine(input);
+    return window.PPExtract.combine(input);
   }
 
   // ---- copy-from-UI (the accurate path for {{tokens}}) --------------------
@@ -240,7 +245,7 @@
     sel.addRange(range);
   }
 
-  // Do what a user does by hand: select all of a field and copy it. Ringg's
+  // Do what a user does by hand: select all of a field and copy it. Dash5's
   // editor serializes mention chips to their {{token}} on copy (the rendered
   // DOM only shows the label), so this recovers @{{callee_name}} etc.
   function copyEditor(el) {
@@ -275,7 +280,7 @@
       //    writes its own HTML (mention chips as data-id="{{token}}") into the
       //    event's clipboardData. No OS clipboard, no permission, no user
       //    gesture needed — this is what makes variables survive even when
-      //    Ringg renders chips with only a friendly label ("Callee Name").
+      //    Dash5 renders chips with only a friendly label ("Callee Name").
       var isRich = !(el.tagName === "TEXTAREA" || el.tagName === "INPUT");
       if (isRich) {
         try {
@@ -330,22 +335,22 @@
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   async function collectSections() {
-    // Rezolv Voicebot Panel has just two fields — read them directly. Never run
-    // Ringg's expand-collapsed logic here (it clicks toggles near headings).
-    if (isGorezolv()) return collectGorezolv();
+    // 2-field dashboard has just two fields — read them directly. Never run
+    // Dash5's expand-collapsed logic here (it clicks toggles near headings).
+    if (isTwoField()) return collectTwoField();
     // Open any collapsed buckets first, then wait for their editors to render.
     try {
-      var opened = window.RinggExtract.expandCollapsed();
+      var opened = window.PPExtract.expandCollapsed();
       if (opened) {
         await sleep(700);
-        window.RinggExtract.expandCollapsed(); // second pass for nested/late toggles
+        window.PPExtract.expandCollapsed(); // second pass for nested/late toggles
         await sleep(300);
       }
     } catch (e) {}
 
     var baseline = buildSections();            // API / DOM fallback
     var map;
-    try { map = window.RinggExtract.sectionEditors(); } catch (e) { map = []; }
+    try { map = window.PPExtract.sectionEditors(); } catch (e) { map = []; }
 
     var prevText = "";
     try { prevText = await navigator.clipboard.readText(); } catch (e) {}
@@ -358,17 +363,17 @@
       var el = m.el;
       if (el) {
         if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-          md = window.RinggExtract.toMarkdown(el.value || "");
+          md = window.PPExtract.toMarkdown(el.value || "");
           if (md) source = "ui";
         } else {
           var cap = await copyEditor(el);
           try {
-            console.log("%c[Ringg MD] " + m.title, "color:#4f46e5;font-weight:bold");
+            console.log("%c[PromptPort] " + m.title, "color:#4f46e5;font-weight:bold");
             console.log("  html:", (cap.html || "(none)").slice(0, 400));
             console.log("  text:", (cap.text || "(none)").slice(0, 400));
           } catch (e) {}
-          if (cap.html) { md = window.RinggExtract.toMarkdown(cap.html); source = "ui"; }
-          else if (cap.text) { md = window.RinggExtract.toMarkdown(cap.text); source = "ui"; }
+          if (cap.html) { md = window.PPExtract.toMarkdown(cap.html); source = "ui"; }
+          else if (cap.text) { md = window.PPExtract.toMarkdown(cap.text); source = "ui"; }
         }
       }
       if (!md) { md = (base.text || "").trim(); source = md ? base.source : "none"; }
@@ -384,7 +389,7 @@
     // lists the buckets in prompt order in every file explorer (which sort
     // alphabetically). The importer strips the numeric prefix, so round-trip
     // matching is unaffected.
-    var SECS = window.RinggExtract.SECTIONS;
+    var SECS = window.PPExtract.SECTIONS;
     var order = SECS.map(function (s) { return s.key; });
     return sections.map(function (s, i) {
       var body = s.text && s.text.trim()
@@ -393,7 +398,7 @@
       var known = !!(s.key && order.indexOf(s.key) !== -1);
       var idx = known ? order.indexOf(s.key) : i;
       // Prefer the canonical export name (e.g. "First_Message") — but ONLY for a
-      // real bucket key; an unknown key (e.g. Rezolv "main-prompt") must not borrow
+      // real bucket key; an unknown key (e.g. Dash2 "main-prompt") must not borrow
       // the name of whichever bucket happens to sit at the same position.
       var def = known ? SECS[idx] : null;
       var base = (def && def.exportName)
@@ -406,7 +411,7 @@
 
   // "2-bucket" export: First Message stays its own file, and the other four
   // buckets are collated — each under a top-level "# Heading" — into a single
-  // Main Prompt. This matches the gorezolv panel's shape (First Message + Main
+  // Main Prompt. This matches the 2-field dashboard's shape (First Message + Main
   // Prompt) and reads as a clean system prompt for an LLM: H1 section names sit
   // above each bucket's own ### structure, empty sections are skipped (no dangling
   // heading), and no "---" dividers (which can turn the line above into a heading).
@@ -417,7 +422,7 @@
   }
 
   function bucketHeading(key) {
-    var SECS = window.RinggExtract.SECTIONS;
+    var SECS = window.PPExtract.SECTIONS;
     for (var i = 0; i < SECS.length; i++) {
       if (SECS[i].key === key) return String(SECS[i].exportName || SECS[i].title || key).replace(/_/g, " ");
     }
@@ -425,7 +430,7 @@
   }
 
   // The ONE way a Main Prompt is built from the 4 buckets — used by both the
-  // 2-bucket export and the Rezolv import, so they always agree (and so it always
+  // 2-bucket export and the Dash2 import, so they always agree (and so it always
   // splits back cleanly with splitMainPrompt).
   function collateMain(partsByKey) {
     var out = [];
@@ -448,10 +453,10 @@
     var fmBody = fm || "<!-- No First Message found. Open the assistant, reload, then export again. -->";
     var mainBody;
     if (byKey["main-prompt"]) {
-      // Rezolv panel: the Main Prompt field is exported exactly as it is.
+      // Dash2 panel: the Main Prompt field is exported exactly as it is.
       mainBody = textOf("main-prompt");
     } else {
-      // Ringg: collate the four buckets under # headings.
+      // Dash5: collate the four buckets under # headings.
       var parts = {};
       MAIN_SPLIT_KEYS.forEach(function (k) { parts[k] = textOf(k); });
       mainBody = collateMain(parts);
@@ -467,8 +472,8 @@
   // Save a ZIP of {name, content} files under `filename`.
   function saveZip(files, filename) {
     var href;
-    try { href = window.RinggZip.toDataUrl(files); }
-    catch (e) { href = URL.createObjectURL(window.RinggZip.make(files)); }
+    try { href = window.PPZip.toDataUrl(files); }
+    catch (e) { href = URL.createObjectURL(window.PPZip.make(files)); }
     var a = document.createElement("a");
     a.href = href;
     a.download = filename;
@@ -493,12 +498,12 @@
   }
 
   // ---- Magic Port export: full bot (prompt + all configs) as one ZIP -------
-  // Prompt travels as the usual .md files (5 on Ringg, 2 on Rezolv); the other
+  // Prompt travels as the usual .md files (5 on Dash5, 2 on Dash2); the other
   // five data points go in magicport.json, read from the captured API JSON by
   // the MagicPort engine. REQ-1 (all variables) and REQ-2 (key types) are
   // enforced in that engine.
   function magicPortPromptFiles(sections) {
-    return isGorezolv() ? sectionsToTwoFiles(sections) : sectionsToFiles(sections);
+    return isTwoField() ? sectionsToTwoFiles(sections) : sectionsToFiles(sections);
   }
   function buildMagicPortFiles(sections) {
     if (!window.MagicPort) return null;
@@ -529,18 +534,17 @@
   }
 
   // ========================================================================
-  //  Rezolv Voicebot Panel (panels.gorezolv.com/voicebot) — export support
+  //  the 2-field dashboard — export support
   // ========================================================================
-  function isGorezolv() {
-    // Rezolv Voicebot Panel: production (panels.gorezolv.com) and QA/dev
-    // (panels.qa.devrezolv.com and other *.devrezolv.com hosts).
-    var h = location.hostname || "";
-    return /(^|\.)panels\.gorezolv\.com$/i.test(h) || /devrezolv\.com$/i.test(h);
+  function isTwoField() {
+    // the 2-field dashboard (production and QA/dev addresses are listed in
+    // manifest.json; host.js matches them).
+    return !!(window.PPHost && window.PPHost.layout() === "dash2");
   }
 
   // The panel's Prompt tab has two TipTap editors, each right after an <h3>
   // label: "First Message" and "Main Prompt". Fall back to document order.
-  function gorezolvEditors() {
+  function twoFieldEditors() {
     function own(e) {
       var t = "";
       for (var i = 0; i < e.childNodes.length; i++) {
@@ -566,15 +570,15 @@
     return { fm: fm, mp: mp };
   }
 
-  async function collectGorezolv() {
-    var m = gorezolvEditors();
+  async function collectTwoField() {
+    var m = twoFieldEditors();
     var prevText = "";
     try { prevText = await navigator.clipboard.readText(); } catch (e) {}
     async function read(el) {
       if (!el) return "";
       var cap = await copyEditor(el);
-      if (cap.html) return window.RinggExtract.toMarkdown(cap.html);
-      if (cap.text) return window.RinggExtract.toMarkdown(cap.text);
+      if (cap.html) return window.PPExtract.toMarkdown(cap.html);
+      if (cap.text) return window.PPExtract.toMarkdown(cap.text);
       return "";
     }
     var fm = await read(m.fm);
@@ -587,7 +591,7 @@
   }
 
   // Split a Main Prompt organised under level-1 "# Section" headings back into
-  // the 4 Ringg buckets. Succeeds ONLY when every # heading names a bucket
+  // the 4 Dash5 buckets. Succeeds ONLY when every # heading names a bucket
   // (Objective, Response Guidelines, Conversation Flow/Script, FAQs), they appear
   // in that order with no repeats, and there's no stray text above the first one.
   // ##/### sub-headings are content; lines inside ``` fences are never headings.
@@ -609,7 +613,7 @@
   function canonicalSection(str) {
     var n = normName(String(str || "").replace(/^\s*\d+\s*[-_.)\]]*\s*/, ""));
     if (!n) return null;
-    var secs = window.RinggExtract.SECTIONS;
+    var secs = window.PPExtract.SECTIONS;
     for (var i = 0; i < secs.length; i++) {
       var names = CANON_NAMES[secs[i].key] || [];
       for (var j = 0; j < names.length; j++) if (normName(names[j]) === n) return secs[i];
@@ -663,14 +667,14 @@
     return { ok: true, parts: parts, found: heads.map(function (x) { return x.key; }) };
   }
 
-  // Turn the two Rezolv fields into the 5 Ringg buckets — or null if Main Prompt
+  // Turn the two Dash2 fields into the 5 Dash5 buckets — or null if Main Prompt
   // isn't organised under the # headings.
-  function gorezolvFiveSections(sections) {
+  function twoFieldFiveSections(sections) {
     var byKey = {};
     (sections || []).forEach(function (s) { if (s && s.key) byKey[s.key] = s; });
     var sp = splitMainPrompt(byKey["main-prompt"] ? byKey["main-prompt"].text : "");
     if (!sp.ok) return null;
-    return window.RinggExtract.SECTIONS.map(function (sec) {
+    return window.PPExtract.SECTIONS.map(function (sec) {
       var text = sec.key === "first-message"
         ? ((byKey["first-message"] || {}).text || "")
         : (sp.parts[sec.key] || "");
@@ -683,9 +687,9 @@
   // clicks. The authoritative check runs again on the collected text at download.
   function liveMainSplit() {
     try {
-      var mp = gorezolvEditors().mp;
+      var mp = twoFieldEditors().mp;
       if (!mp) return { ok: false, reason: "Main Prompt editor not found on this page.", present: [] };
-      var md = window.RinggExtract.toMarkdown(mp.innerHTML || "");
+      var md = window.PPExtract.toMarkdown(mp.innerHTML || "");
       var r = splitMainPrompt(md);
       r.present = mainHeadingKeys(md);
       return r;
@@ -706,7 +710,7 @@
     return out;
   }
 
-  function fallbackSections() { return isGorezolv() ? [] : buildSections(); }
+  function fallbackSections() { return isTwoField() ? [] : buildSections(); }
 
   // One place that performs a download in either format, on either site.
   function doDownload(format, sections) {
@@ -720,8 +724,8 @@
       _lastDl = "2-bucket ZIP downloaded."; setLinks(true);
       return true;
     }
-    if (isGorezolv()) {
-      var five = gorezolvFiveSections(secs);
+    if (isTwoField()) {
+      var five = twoFieldFiveSections(secs);
       if (!five) {
         var why = splitMainPrompt(((secs.filter(function (s) { return s.key === "main-prompt"; })[0]) || {}).text || "").reason;
         toast("Can't split into 5 buckets — " + why + " Use Download 2 Buckets.");
@@ -758,7 +762,7 @@
     var cands = [normName(base)];
     var ns = normName(stripped);
     if (ns && cands.indexOf(ns) === -1) cands.push(ns);
-    var secs = window.RinggExtract.SECTIONS;
+    var secs = window.PPExtract.SECTIONS;
     for (var i = 0; i < secs.length; i++) {
       var sec = secs[i];
       var keys = [normName(sec.filename.replace(/\.md$/i, "")), normName(sec.title)];
@@ -828,11 +832,11 @@
     return sanitizeHtml(html); // never paste unsanitized HTML into the page
   }
 
-  // A bare variable token in the exported markdown, in any of the 3 Ringg forms:
+  // A bare variable token in the exported markdown, in any of the 3 Dash5 forms:
   //   @{{customer_name}}   custom variable
   //   @((greetings.date))  platform variable
   //   @||send_payment_link|| tool action
-  // Ringg's editor turns a pasted <span data-type="mention" data-id="TOKEN"> back
+  // Dash5's editor turns a pasted <span data-type="mention" data-id="TOKEN"> back
   // into a real variable CHIP (verified live) — but only for text/HTML pastes, and
   // only for variables the assistant actually defines. Bare tokens pasted as plain
   // text stay as literal "@{{…}}" characters, which is the "plain paste" bug.
@@ -879,7 +883,7 @@
 
   // Import target HTML: markdown -> HTML (tables/headings/lists/bold) with bare
   // variable tokens re-wrapped as mention spans, then sanitized. Pasting THIS as
-  // text/html makes Ringg render the formatting AND rebuild the variable chips —
+  // text/html makes Dash5 render the formatting AND rebuild the variable chips —
   // matching the source, instead of plain-pasting literal markdown.
   // Raw HTML inside the markdown: real tags (formatting, tables we exported as
   // HTML, comments) pass through to the sanitizer; anything else that merely
@@ -937,11 +941,11 @@
     html = hydrateMentions(html);
     html = sanitizeHtml(html); // keeps mention spans + formatting, strips anything unsafe
     html = collapseStructuralWhitespace(html);
-    if (isGorezolv()) html = breaksToParagraphs(html);
+    if (isTwoField()) html = breaksToParagraphs(html);
     return html;
   }
 
-  // The Rezolv editor has no hard line break: a pasted <br> collapses into a
+  // The Dash2 editor has no hard line break: a pasted <br> collapses into a
   // space and "line one<br>line two" runs together. Split at each <br> into
   // separate paragraphs instead, so every line stays on its own line.
   var BR_BLOCKS = "p,li,td,th,h1,h2,h3,h4,h5,h6,blockquote";
@@ -1033,7 +1037,7 @@
   }
 
   // Replace a rich editor's content with MARKDOWN, exactly like a human paste.
-  // Ringg's editor (TipTap/ProseMirror) renders markdown from the clipboard's
+  // Dash5's editor (TipTap/ProseMirror) renders markdown from the clipboard's
   // text/plain — pipes become real tables, ## become headings, ** become bold,
   // "- " become lists. So we paste the RAW markdown as text/plain (NOT HTML,
   // and NOT flattened text, which is what dropped tables before). We first fire
@@ -1082,7 +1086,7 @@
 
   // A pasted result is "dirty" if the editor ended up with an empty spacer
   // paragraph / heading — the blank-line artifact. Our source HTML never contains
-  // empty blocks (collapseStructuralWhitespace guarantees it) and a clean Ringg
+  // empty blocks (collapseStructuralWhitespace guarantees it) and a clean Dash5
   // doc for this content has none either, so ANY such block is a paste glitch.
   function spacerBlocks(editorEl) {
     // Empty paragraphs/headings/list items OUTSIDE table cells. An empty cell
@@ -1107,7 +1111,7 @@
       var expected = htmlToText(html).replace(/\s+/g, " ").trim();
       // Clearing a field: pasting "" (or an empty <p>) is a no-op in TipTap, so
       // clear the way a person would — Mod-A then Backspace — which ProseMirror
-      // turns into one clean empty paragraph (verified live on Rezolv).
+      // turns into one clean empty paragraph (verified live on Dash2).
       var clearing = expected === "";
       function curText() { return (editorEl.innerText || editorEl.textContent || "").replace(/\s+/g, " ").trim(); }
       function selectAllAndPaste() {
@@ -1193,26 +1197,25 @@
   //  SMART IMPORT — one pipeline for both sites and both ZIP shapes
   // ========================================================================
   // 1) Read whatever was dropped into a neutral "source": { parts: {key: text},
-  //    kind, unmatched, mainWhole } where key is a Ringg bucket key or
+  //    kind, unmatched, mainWhole } where key is a Dash5 bucket key or
   //    "main-prompt" (a 2-bucket Main Prompt file).
   // 2) resolveImportPlan(src, curMap) maps that source onto THIS site's fields:
-  //      Ringg  ← 5-bucket: file → bucket
-  //      Ringg  ← 2-bucket: First Message → First Message; Main Prompt split by
+  //      Dash5  ← 5-bucket: file → bucket
+  //      Dash5  ← 2-bucket: First Message → First Message; Main Prompt split by
   //                         its # headings into the 4 buckets
-  //      Rezolv ← 5-bucket: First Message → First Message; 4 buckets collated
+  //      Dash2 ← 5-bucket: First Message → First Message; 4 buckets collated
   //                         under # headings → Main Prompt
-  //      Rezolv ← 2-bucket: both files as-is
-  var REZOLV_TARGETS = [
+  //      Dash2 ← 2-bucket: both files as-is
+  var DASH2_TARGETS = [
     { key: "first-message", title: "First Message", filename: "First message.md" },
     { key: "main-prompt", title: "Main Prompt", filename: "Main Prompt.md" }
   ];
   function siteTargets() {
-    return isGorezolv() ? REZOLV_TARGETS : window.RinggExtract.SECTIONS;
+    return isTwoField() ? DASH2_TARGETS : window.PPExtract.SECTIONS;
   }
   function targetByKey(key) {
     return siteTargets().filter(function (t) { return t.key === key; })[0] || null;
   }
-  function siteName() { return isGorezolv() ? "Rezolv" : "Ringg"; }
 
   function isMainPromptName(fileName) {
     var base = fileStem(fileName);
@@ -1246,7 +1249,7 @@
   // bucket name (with or without the "N_" order prefix).
   async function readZipSource(arrayBuffer) {
     var entries;
-    try { entries = await window.RinggUnzip.read(arrayBuffer); }
+    try { entries = await window.PPUnzip.read(arrayBuffer); }
     catch (e) {
       if (e instanceof RangeError || /DataView|bounds|offset/i.test(String(e && e.message))) {
         throw new Error("The zip looks damaged (its file list points outside the file). Re-export or re-zip it and try again.");
@@ -1328,8 +1331,8 @@
 
     if (has("first-message")) matched.push(mkMatch("first-message", cleanText(P["first-message"])));
 
-    if (!isGorezolv()) {
-      // ---------------- Ringg (5 buckets) ----------------
+    if (!isTwoField()) {
+      // ---------------- Dash5 (5 buckets) ----------------
       var bucket = {};
       MAIN_SPLIT_KEYS.forEach(function (k) { if (has(k)) bucket[k] = cleanText(P[k]); });
       if (has("main-prompt")) {
@@ -1386,7 +1389,7 @@
         if (Object.prototype.hasOwnProperty.call(bucket, k)) matched.push(mkMatch(k, bucket[k]));
       });
     } else {
-      // ---------------- Rezolv (First Message + Main Prompt) ----------------
+      // ---------------- Dash2 (First Message + Main Prompt) ----------------
       var incoming = {};
       MAIN_SPLIT_KEYS.forEach(function (k) { if (has(k)) incoming[k] = cleanText(P[k]); });
       var nIn = Object.keys(incoming).length;
@@ -1453,14 +1456,14 @@
   // The site's editors keyed by field key.
   function siteEditors() {
     var editors = {};
-    if (isGorezolv()) {
-      var g = gorezolvEditors();
+    if (isTwoField()) {
+      var g = twoFieldEditors();
       if (g.fm) editors["first-message"] = g.fm;
       if (g.mp) editors["main-prompt"] = g.mp;
       return editors;
     }
     try {
-      window.RinggExtract.sectionEditors().forEach(function (m) { editors[m.key] = m.el; });
+      window.PPExtract.sectionEditors().forEach(function (m) { editors[m.key] = m.el; });
     } catch (e) {}
     return editors;
   }
@@ -1488,10 +1491,10 @@
 
   // Perform the writes. Returns per-section results.
   async function runImport(matched) {
-    if (!isGorezolv()) {
+    if (!isTwoField()) {
       try {
-        var opened = window.RinggExtract.expandCollapsed();
-        if (opened) { await sleep(700); window.RinggExtract.expandCollapsed(); await sleep(300); }
+        var opened = window.PPExtract.expandCollapsed();
+        if (opened) { await sleep(700); window.PPExtract.expandCollapsed(); await sleep(300); }
       } catch (e) {}
     }
 
@@ -1529,8 +1532,8 @@
   }
 
   // ---- Auto-backup before import (safety net) -----------------------------
-  // Snapshot the CURRENT on-screen content of this site's fields (5 Ringg
-  // buckets, or Rezolv's First Message + Main Prompt). collectSections reads the
+  // Snapshot the CURRENT on-screen content of this site's fields (5 Dash5
+  // buckets, or Dash2's First Message + Main Prompt). collectSections reads the
   // live editors, so this captures unsaved edits too.
   async function snapshotBuckets() {
     var sections = await collectSections();
@@ -1543,7 +1546,7 @@
     return { when: new Date(), sections: sections, matched: matched, importedKeys: [] };
   }
 
-  function backupWhat() { return isGorezolv() ? "First Message + Main Prompt" : "the 5 buckets"; }
+  function backupWhat() { return isTwoField() ? "First Message + Main Prompt" : "the 5 buckets"; }
 
   function backupStamp(d) {
     d = d || new Date();
@@ -1555,7 +1558,7 @@
   function downloadBackup() {
     if (!_lastBackup) { toast("No backup available yet."); return; }
     try {
-      var files = isGorezolv() ? sectionsToTwoFiles(_lastBackup.sections) : sectionsToFiles(_lastBackup.sections);
+      var files = isTwoField() ? sectionsToTwoFiles(_lastBackup.sections) : sectionsToFiles(_lastBackup.sections);
       saveZip(files, "backup-" + fileBase(nameFromUI() || assistantName()) + "-" + backupStamp(_lastBackup.when) + ".zip");
       toast("Backup downloaded — " + backupWhat() + " as they were before this import.");
       setLinks(true);
@@ -1602,7 +1605,7 @@
   function matchSectionByHeading(str) {
     var n = normName(str);
     if (!n) return null;
-    var secs = window.RinggExtract.SECTIONS;
+    var secs = window.PPExtract.SECTIONS;
     for (var i = 0; i < secs.length; i++) {
       var sec = secs[i];
       if (normName(sec.title) === n) return sec;
@@ -1726,7 +1729,7 @@
   function planFromMatched(matched) {
     var seen = {};
     matched.forEach(function (m) { seen[m.sec.key] = true; });
-    var missing = window.RinggExtract.SECTIONS
+    var missing = window.PPExtract.SECTIONS
       .filter(function (s) { return !seen[s.key]; })
       .map(function (s) { return s.title; });
     return { matched: matched, unmatched: [], missing: missing };
@@ -1807,11 +1810,11 @@
   // ========================================================================
   function normForDiff(s) {
     s = String(s == null ? "" : s).replace(/\r/g, "");
-    // On Rezolv a markdown hard break ("two spaces + newline") becomes a new
+    // On Dash2 a markdown hard break ("two spaces + newline") becomes a new
     // paragraph (that editor has no line breaks), so compare them as equal.
     s = s.replace(/[ \t]+$/gm, "");
     // Lines only: blank lines (paragraph vs line-break, loose vs tight lists) don't count.
-    if (isGorezolv()) s = s.replace(/\n{2,}/g, "\n");
+    if (isTwoField()) s = s.replace(/\n{2,}/g, "\n");
     return s.replace(/\n+$/, "");
   }
 
@@ -1860,22 +1863,22 @@
   // ========================================================================
   function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
-  // The searchable editors on this site: Ringg's 5 buckets, or the 2-field
+  // The searchable editors on this site: Dash5's 5 buckets, or the 2-field
   // page's First Message + Main Prompt.
   function findEditors() {
-    if (isGorezolv()) {
-      var g = gorezolvEditors(), out = [];
+    if (isTwoField()) {
+      var g = twoFieldEditors(), out = [];
       if (g.fm) out.push({ key: "first-message", title: "First Message", el: g.fm });
       if (g.mp) out.push({ key: "main-prompt", title: "Main Prompt", el: g.mp });
       return out;
     }
-    try { return window.RinggExtract.sectionEditors(); } catch (e) { return []; }
+    try { return window.PPExtract.sectionEditors(); } catch (e) { return []; }
   }
   async function openCollapsedForFind() {
-    if (isGorezolv()) return;   // both fields are always on screen
+    if (isTwoField()) return;   // both fields are always on screen
     try {
-      var opened = window.RinggExtract.expandCollapsed();
-      if (opened) { await sleep(700); window.RinggExtract.expandCollapsed(); await sleep(300); }
+      var opened = window.PPExtract.expandCollapsed();
+      if (opened) { await sleep(700); window.PPExtract.expandCollapsed(); await sleep(300); }
     } catch (e) {}
   }
   // Whole word must work for any script (Hindi, emoji) and for queries that start
@@ -1888,11 +1891,11 @@
   }
 
   function ensureHighlightStyle() {
-    if (document.getElementById("ringg-find-style")) return;
+    if (document.getElementById("pp-find-style")) return;
     var st = document.createElement("style");
-    st.id = "ringg-find-style";
-    st.textContent = "::highlight(ringg-find){background:#fde047;color:#000;} " +
-                     "::highlight(ringg-find-current){background:#fb923c;color:#000;}";
+    st.id = "pp-find-style";
+    st.textContent = "::highlight(pp-find){background:#fde047;color:#000;} " +
+                     "::highlight(pp-find-current){background:#fb923c;color:#000;}";
     document.head.appendChild(st);
   }
 
@@ -1902,22 +1905,22 @@
 
   function clearHighlights() {
     _findRanges = []; _findIdx = -1;
-    try { if (window.CSS && CSS.highlights) { CSS.highlights.delete("ringg-find"); CSS.highlights.delete("ringg-find-current"); } } catch (e) {}
+    try { if (window.CSS && CSS.highlights) { CSS.highlights.delete("pp-find"); CSS.highlights.delete("pp-find-current"); } } catch (e) {}
   }
 
   // Paint all matches yellow except the current one, which is painted orange.
   function paintFindHighlights() {
     try {
       if (!(window.CSS && CSS.highlights && window.Highlight)) return;
-      CSS.highlights.delete("ringg-find");
-      CSS.highlights.delete("ringg-find-current");
+      CSS.highlights.delete("pp-find");
+      CSS.highlights.delete("pp-find-current");
       if (!_findRanges.length) return;
       var all = new Highlight();
       for (var i = 0; i < _findRanges.length; i++) if (i !== _findIdx) all.add(_findRanges[i]);
-      CSS.highlights.set("ringg-find", all);
+      CSS.highlights.set("pp-find", all);
       if (_findIdx >= 0 && _findRanges[_findIdx]) {
         var cur = new Highlight(); cur.add(_findRanges[_findIdx]);
-        CSS.highlights.set("ringg-find-current", cur);
+        CSS.highlights.set("pp-find-current", cur);
       }
     } catch (e) {}
   }
@@ -1991,7 +1994,7 @@
       while ((node = walker.nextNode())) {
         var text = node.nodeValue;
         if (!text) continue;
-        // Variable chips are not prompt text (Ringg shows a friendly label like
+        // Variable chips are not prompt text (Dash5 shows a friendly label like
         // "Callee Name"); never count them, so Find agrees with Replace.
         if (node.parentElement && node.parentElement.closest(MENTION_SEL)) continue;
         re.lastIndex = 0;
@@ -2197,6 +2200,8 @@
 .rs-row.rs-three{display:grid;grid-template-columns:1fr 1.35fr 1fr;gap:10px}
 .rs-btn svg{width:auto}
 .rs-ctas{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.rs-cta.rs-cta-wide{display:flex;width:100%;margin-top:12px;flex-direction:row;align-items:center;justify-content:center;gap:8px;min-height:0;height:36px;padding:0 14px}
+.rs-cta.rs-cta-wide svg{width:24px;height:19px;flex:none}
 .rs-cta{flex-direction:column;gap:4px;padding:12px 8px 10px;min-height:126px;background:var(--mist);color:var(--ink);box-shadow:3px 3px 0 var(--ink);font-size:13px}
 .rs-cta:nth-child(even){border-radius:var(--sk2)}
 .rs-cta:hover{box-shadow:4px 4px 0 var(--ink);transform:translate(-1px,-1px)}
@@ -2317,7 +2322,155 @@
 .rs-dropzone:focus-visible,.rs-view-changes:focus-visible,.rs-linkic:focus-visible,.rs-check:focus-within,.rs-choice:focus-within{outline:2px solid var(--ink);outline-offset:2px}
 .rs-tab:focus-visible{outline-offset:-2px}
 @media (max-height:620px){.rs-trust-t{display:none}.rs-cta{min-height:96px}.rs-cta svg{width:44px;height:34px}}
-@media (prefers-reduced-motion:reduce){:host *,:host *::before,:host *::after{animation:none!important;transition:none!important}}
+@media (max-height:560px){.rs-cta:not(.rs-cta-wide){min-height:76px;padding:8px 6px 7px;gap:2px}.rs-cta:not(.rs-cta-wide) svg{width:32px;height:25px}.rs-cta.rs-cta-wide{height:32px;margin-top:8px}}
+@media (max-height:480px){.rs-phead{min-height:34px;padding-top:2px}.rs-x{width:36px;height:36px}.rs-tab{min-height:34px;padding:6px 4px 8px}.rs-foot{padding:9px 14px 9px}.rs-cta:not(.rs-cta-wide){min-height:48px;padding:6px 6px}.rs-cta:not(.rs-cta-wide) svg{display:none}.rs-cta.rs-cta-wide{height:30px;margin-top:6px}.rs-foot-meta{margin-top:2px}}
+/* ---- motion system: paper, ink and springs (all off under reduced-motion) ---- */
+:host{--rs-spring:cubic-bezier(.34,1.56,.64,1);--rs-out:cubic-bezier(.16,1,.3,1)}
+@keyframes rs-in{0%{opacity:0;transform:translate(22px,34px) scale(.8) rotate(3.5deg)}55%{opacity:1;transform:translate(-2px,-4px) scale(1.018) rotate(-.7deg)}78%{transform:translate(1px,1px) scale(.996) rotate(.25deg)}100%{opacity:1;transform:none}}
+.rs-panel.rs-enter{animation:rs-in .6s var(--rs-out)}
+@keyframes rs-rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes rs-fade{from{opacity:.2}to{opacity:1}}
+@keyframes rs-slide-r{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:none}}
+@keyframes rs-slide-l{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:none}}
+@keyframes rs-sheet{0%{opacity:0;transform:translateY(-18px) rotate(var(--rs-r,-2.5deg)) scale(.97)}60%{opacity:1;transform:translateY(2px) rotate(calc(var(--rs-r,-2.5deg) * -.3))}100%{opacity:1;transform:none}}
+@keyframes rs-draw{to{stroke-dashoffset:0}}
+@keyframes rs-popin{0%{transform:scale(.3) rotate(-25deg);opacity:0}55%{transform:scale(1.25) rotate(6deg);opacity:1}80%{transform:scale(.94)}100%{transform:none;opacity:1}}
+@keyframes rs-twinkle{0%,100%{transform:none;opacity:1}50%{transform:scale(1.8) rotate(90deg);opacity:.75}}
+@keyframes rs-shake{0%,100%{transform:none}15%{transform:translateX(-6px) rotate(-7deg)}30%{transform:translateX(6px) rotate(6deg)}45%{transform:translateX(-4px) rotate(-4deg)}60%{transform:translateX(4px) rotate(3deg)}80%{transform:translateX(-2px)}}
+@keyframes rs-bob{0%,100%{transform:none}50%{transform:translateY(-5px)}}
+@keyframes rs-dive{0%,100%{transform:none}45%{transform:translateY(9px)}}
+@keyframes rs-spin{to{transform:rotate(360deg)}}
+@keyframes rs-squig-slide{from{transform:translateX(var(--rs-from,0)) scaleX(1.6)}to{transform:none}}
+@keyframes rs-hello{0%,100%{transform:none}20%{transform:rotate(-7deg) scale(1.06)}40%{transform:rotate(6deg) scale(1.06)}60%{transform:rotate(-3deg)}80%{transform:rotate(2deg)}}
+@keyframes rs-hello-star{from{transform:none}to{transform:rotate(360deg) scale(1)}}
+@keyframes rs-timer{to{transform:scaleX(0)}}
+@keyframes rs-shine{from{transform:translateX(-120%) skewX(-20deg)}to{transform:translateX(220%) skewX(-20deg)}}
+@keyframes rs-march{to{stroke-dashoffset:-24}}
+@keyframes rs-catch{0%,100%{transform:none}12%{transform:scale(1.06) rotate(-1deg)}30%{transform:none}}
+@keyframes rs-breathe{0%,100%{opacity:.55}50%{opacity:1}}
+/* overlay layer for bursts, confetti and flying files */
+.rs-fx{position:fixed;inset:0;pointer-events:none;z-index:2147483647}
+.rs-fx-ray{position:fixed;width:3px;height:10px;border-radius:2px;background:var(--ink);pointer-events:none;display:block}
+.rs-fx-bit{position:fixed;margin:-4px 0 0 -4px;pointer-events:none;display:block}
+.rs-fx-rect{width:6px;height:11px;border-radius:1px}
+.rs-fx-dot{width:8px;height:8px;border-radius:50%}
+.rs-fx-star svg,.rs-fx-squig svg{display:block}
+.rs-fx-file{position:fixed;width:30px;height:30px;pointer-events:none;display:block;filter:drop-shadow(2px 3px 0 rgba(0,0,0,.18))}
+/* screen changes inside an open panel: slide toward the chosen tab, or cross-fade */
+.rs-panel.rs-swap .rs-body,.rs-panel.rs-swap .rs-foot{animation:rs-fade .22s ease-out}
+.rs-panel.rs-swap.rs-dir-r .rs-body,.rs-panel.rs-swap.rs-dir-r .rs-foot{animation:rs-slide-r .38s var(--rs-out)}
+.rs-panel.rs-swap.rs-dir-l .rs-body,.rs-panel.rs-swap.rs-dir-l .rs-foot{animation:rs-slide-l .38s var(--rs-out)}
+/* buttons: lift on hover, squash-and-stamp into the paper on press */
+.rs-btn{transition:transform .28s var(--rs-spring),box-shadow .2s var(--rs-out),background .2s,opacity .25s;position:relative;overflow:hidden}
+.rs-btn-primary:not(:disabled):not([aria-disabled="true"]):hover,.rs-btn-danger:not(:disabled):hover{transform:translate(-2px,-2px);box-shadow:5px 5px 0 var(--steel)}
+.rs-btn-ghost:not(:disabled):hover{transform:translate(-1px,-1px)}
+.rs-btn:not(:disabled):not([aria-disabled="true"]):active,.rs-cta:not(:disabled):active{transform:translate(3px,3px) scale(.97,.94);box-shadow:0 0 0 var(--ink);transition-duration:.06s}
+.rs-btn.rs-shine::after{content:"";position:absolute;top:-10%;bottom:-10%;left:0;width:40%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);animation:rs-shine .75s var(--rs-out) forwards;pointer-events:none}
+/* download tiles: pages fan out like a hand of cards; Magic Port's cube hops and its arrow orbits */
+.rs-cta{transition:transform .3s var(--rs-spring),box-shadow .2s var(--rs-out),background .2s}
+.rs-cta:not(:disabled):hover{transform:translate(-2px,-3px) rotate(-.6deg);box-shadow:5px 6px 0 var(--ink)}
+.rs-cta:nth-child(even):not(:disabled):hover{transform:translate(-2px,-3px) rotate(.6deg)}
+.rs-cta.rs-cta-wide:not(:disabled):hover{transform:translate(-1px,-2px);box-shadow:4px 5px 0 var(--ink)}
+.rs-pg,.rs-pt,.rs-cube,.rs-orbit{transform-box:view-box;transition:transform .5s var(--rs-spring)}
+.rs-pg,.rs-pt{transform-origin:29px 46px}
+.rs-cta:not(:disabled):hover .rs-pg1{transform:translate(-7px,1px) rotate(-11deg)}
+.rs-cta:not(:disabled):hover .rs-pg2{transform:translate(-3.5px,-1px) rotate(-5.5deg)}
+.rs-cta:not(:disabled):hover .rs-pg3{transform:translateY(-4px)}
+.rs-cta:not(:disabled):hover .rs-pg4{transform:translate(3.5px,-1px) rotate(5.5deg)}
+.rs-cta:not(:disabled):hover .rs-pg5{transform:translate(7px,1px) rotate(11deg)}
+.rs-cta:not(:disabled):hover .rs-pt1{transform:translate(-6px,-1px) rotate(-10deg)}
+.rs-cta:not(:disabled):hover .rs-pt2{transform:translate(6px,-2px) rotate(8deg)}
+.rs-cube,.rs-orbit{transform-origin:22px 26px}
+.rs-orbit{transition:transform .8s var(--rs-out)}
+.rs-cta:not(:disabled):hover .rs-cube{transform:translateY(-4px) rotate(-10deg) scale(1.06)}
+.rs-cta:not(:disabled):hover .rs-orbit{transform:rotate(360deg)}
+.rs-spark{transform-box:fill-box;transform-origin:center}
+.rs-cta:not(:disabled):hover .rs-spark{animation:rs-twinkle .7s var(--rs-out) .15s}
+.rs-ctas>.rs-cta{animation:rs-rise .45s var(--rs-spring) backwards}
+.rs-ctas>.rs-cta:nth-child(2){animation-delay:.07s}
+.rs-cta-wide{animation:rs-rise .45s var(--rs-spring) .14s backwards}
+/* tabs: the squiggle slides from the old tab to the new one (or sketches itself on open) */
+.rs-tab{transition:color .2s,transform .3s var(--rs-spring)}
+.rs-tab:not(.active):hover{transform:translateY(-2px)}
+.rs-tab.active.rs-fresh .rs-squig path{stroke-dasharray:100;stroke-dashoffset:100;animation:rs-draw .5s var(--rs-out) .1s forwards}
+.rs-tab.active.rs-slide .rs-squig{animation:rs-squig-slide .55s var(--rs-spring)}
+/* lists: sheets of paper drop onto the stack; ticks pop and draw; chars roll up */
+.rs-card:not(.rs-loading){animation:rs-sheet .5s var(--rs-out) backwards;animation-delay:var(--rs-d,0s);transition:transform .3s var(--rs-spring)}
+.rs-card:nth-child(even){--rs-r:2.5deg}
+.rs-line{animation:rs-rise .36s var(--rs-out) backwards;animation-delay:var(--rs-d,0s)}
+.rs-card:nth-child(2),.rs-line:nth-child(2){--rs-d:.05s}
+.rs-card:nth-child(3),.rs-line:nth-child(3){--rs-d:.1s}
+.rs-card:nth-child(4),.rs-line:nth-child(4){--rs-d:.15s}
+.rs-card:nth-child(5),.rs-line:nth-child(5){--rs-d:.2s}
+.rs-card:nth-child(6),.rs-line:nth-child(6){--rs-d:.25s}
+.rs-card:nth-child(7),.rs-line:nth-child(7){--rs-d:.3s}
+.rs-card:nth-child(n+8),.rs-line:nth-child(n+8){--rs-d:.35s}
+.rs-card:not(.rs-loading):hover{transform:translateX(4px) rotate(-.5deg)}
+.rs-card:not(.rs-loading) .rs-ic svg,.rs-line-dot{animation:rs-popin .55s var(--rs-out) backwards;animation-delay:calc(var(--rs-d,0s) + .18s)}
+.rs-drawp{stroke-dasharray:1;stroke-dashoffset:1;animation:rs-draw .4s var(--rs-out) forwards;animation-delay:calc(var(--rs-d,0s) + .38s)}
+.rs-card.rs-loading .rs-ic,.rs-card.rs-loading .rs-sk{animation:rs-breathe 1.1s ease-in-out infinite}
+/* results: the big mark pops and draws (confetti follows); a failure mark shakes */
+.rs-donehead svg{animation:rs-popin .6s var(--rs-out) backwards}
+.rs-donehead .rs-drawp{animation-delay:.35s;animation-duration:.5s}
+.rs-donehead svg.rs-shake{animation:rs-popin .45s var(--rs-out) backwards,rs-shake .6s ease-in-out .45s}
+/* "Porting Successful": the face draws itself, the smile follows, the eyes pop and blink once */
+@keyframes rs-blink{0%,100%{transform:none}50%{transform:scaleY(.1)}}
+.rs-smile{animation:rs-popin .6s var(--rs-out) backwards}
+.rs-smile circle{stroke-dasharray:1;stroke-dashoffset:1;animation:rs-draw .65s var(--rs-out) .15s forwards}
+.rs-smile path{stroke-dasharray:1;stroke-dashoffset:1;animation:rs-draw .45s var(--rs-out) .7s forwards}
+.rs-smile line{transform-box:fill-box;transform-origin:center;animation:rs-popin .4s var(--rs-out) .95s backwards,rs-blink .32s ease-in-out 2.1s}
+.rs-mp-success .rs-donehead-t{animation:rs-rise .55s var(--rs-spring) .55s backwards;font-size:17px}
+.rs-mp-success .rs-donehead-s{animation:rs-rise .5s var(--rs-out) .7s backwards}
+/* callouts, checkboxes, consent */
+.rs-callout{animation:rs-rise .38s var(--rs-out) .08s backwards}
+.rs-mp-consent{transition:border-color .25s,background .25s,transform .3s var(--rs-spring)}
+.rs-mp-keys{margin:8px 0}
+.rs-mp-keys-d{border:2px solid var(--ink);border-radius:var(--sk2);background:var(--paper);padding:0;font-size:12.5px}
+.rs-mp-keys-d>summary{cursor:pointer;padding:8px 12px;font-weight:bold;list-style-position:inside}
+.rs-mp-keys-t{border-top:2px dashed var(--ash);max-height:200px;overflow:auto;padding:4px 0}
+.rs-mp-key{display:flex;justify-content:space-between;gap:10px;padding:3px 12px;line-height:1.45}
+.rs-mp-key-n{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;min-width:0;overflow-wrap:anywhere}
+.rs-mp-key-t{flex:none;font-weight:bold;white-space:nowrap}
+.rs-mp-key.flag{background:#fff7ed}.rs-mp-key.flag .rs-mp-key-t{color:#b45309}
+.rs-mp-consent:has(input:checked){border-color:#16a34a;background:#f0fdf4}
+.rs-mp-consent-cb:checked,.rs-check input:checked,.rs-choice input:checked{animation:rs-popin .45s var(--rs-out)}
+/* toasts: spring in with a tilt; a bar shows how long they stay */
+.rs-toast{position:relative;overflow:hidden;animation:rs-toast-in .55s var(--rs-spring)}
+@keyframes rs-toast-in{from{opacity:0;transform:translateX(48px) rotate(5deg) scale(.88)}to{opacity:1;transform:none}}
+.rs-toast::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--ink);opacity:.22;transform-origin:left;animation:rs-timer 3.6s linear forwards}
+.rs-tic{animation:rs-popin .5s var(--rs-out) .12s backwards}
+/* small icons */
+.rs-launcher.rs-hello{animation:rs-hello .9s var(--rs-out)}
+.rs-launcher.rs-hello .rs-star{animation:rs-hello-star .9s var(--rs-out)}
+.rs-star{transition:transform .6s var(--rs-spring)}
+.rs-launcher:hover .rs-star{transform:rotate(144deg) scale(1.3)}
+.rs-x svg{transition:transform .35s var(--rs-spring)}
+.rs-x:hover svg{transform:rotate(90deg) scale(1.15)}
+.rs-linkic{transition:transform .3s var(--rs-spring),background .2s}
+.rs-linkic:hover{transform:translateY(-3px) rotate(-6deg) scale(1.08)}
+.rs-links:not([hidden]) .rs-linkic{animation:rs-popin .5s var(--rs-out) backwards}
+.rs-links:not([hidden]) .rs-linkic:nth-child(2){animation-delay:.08s}
+.rs-links:not([hidden]) .rs-linkic:nth-child(3){animation-delay:.16s}
+.rs-undo-ic{transition:transform .6s var(--rs-out)}
+.rs-btn:hover .rs-undo-ic{transform:rotate(-360deg)}
+.rs-btn:hover .rs-dl-ic{animation:rs-dive .7s var(--rs-out)}
+/* import tray: the arrow keeps diving in while hovered; a dragged file drops the page in */
+.rs-dropzone{transition:background .2s,transform .3s var(--rs-spring)}
+.rs-dropzone:hover{transform:scale(1.015)}
+.rs-dropzone.over{transform:scale(1.04) rotate(-.6deg)}
+.rs-dz-arrow,.rs-dz-paper{transform-box:view-box;transition:transform .45s var(--rs-spring)}
+.rs-dropzone:hover .rs-dz-arrow{animation:rs-dive .9s var(--rs-out) infinite}
+.rs-dropzone:hover .rs-dz-paper{transform:translateY(-4px) rotate(-3deg)}
+.rs-dropzone.over .rs-dz-paper{transform:translateY(16px) rotate(2deg)}
+/* migration: the port scene */
+.rs-port{display:block;margin:4px auto 2px;max-width:330px}
+.rs-port-path{stroke-dasharray:6 6;animation:rs-march .8s linear infinite}
+.rs-port-dst{transform-box:fill-box;transform-origin:center;animation:rs-catch .6s ease-out infinite}
+.rs-port-spark{transform-box:fill-box;transform-origin:center;animation:rs-twinkle 1.4s ease-in-out infinite}
+.rs-port-spark.s2{animation-delay:.7s}
+.rs-working{display:inline-flex;align-items:center;gap:8px}
+.rs-working svg{flex:none;animation:rs-spin .9s linear infinite}
+@media (prefers-reduced-motion:reduce){:host *,:host *::before,:host *::after{animation:none!important;transition:none!important}.rs-drawp,.rs-squig path,.rs-smile circle,.rs-smile path{stroke-dashoffset:0!important}}
 `;
 
   var UI = { host: null, root: null, launcher: null, card: null, badge: null, links: null };
@@ -2326,22 +2479,24 @@
     star: '<svg class="rs-star" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 1l2 6 6 2-6 2-2 6-2-6-6-2 6-2z" fill="#ececec" stroke="#ffffff" stroke-width="1.2" stroke-linejoin="round"/></svg>',
     lock: '<svg width="12" height="14" viewBox="0 0 14 16" aria-hidden="true"><path d="M2 7h10l-.5 7.5h-9z" fill="#ececec" stroke="#1a1a1a" stroke-width="1.5" stroke-linejoin="round"/><path d="M4 7V5a3 3 0 0 1 6 0v2" fill="none" stroke="#1a1a1a" stroke-width="1.5"/></svg>',
     x: '<svg width="16" height="16" viewBox="0 0 18 18" aria-hidden="true"><path d="M3 3c4 4 8 9 12 12M15 3C11 7 7 11 3 15" stroke="#1a1a1a" stroke-width="2.2" fill="none" stroke-linecap="round"/></svg>',
-    squig: '<svg class="rs-squig" viewBox="0 0 80 8" preserveAspectRatio="none" aria-hidden="true"><path d="M2 5c8-4 14 3 22 0s14-4 22 0 14 3 22 0 8-2 10-1" stroke="#1a1a1a" stroke-width="3" fill="none" stroke-linecap="round"/></svg>',
-    tick: '<svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 2c7 0 11 5 11 11s-5 11-11 11S2 19 2 13 7 2 14 2" fill="#1a1a1a"/><path d="M7.5 13l4 4 7-8.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    squig: '<svg class="rs-squig" viewBox="0 0 80 8" preserveAspectRatio="none" aria-hidden="true"><path pathLength="100" d="M2 5c8-4 14 3 22 0s14-4 22 0 14 3 22 0 8-2 10-1" stroke="#1a1a1a" stroke-width="3" fill="none" stroke-linecap="round"/></svg>',
+    tick: '<svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 2c7 0 11 5 11 11s-5 11-11 11S2 19 2 13 7 2 14 2" fill="#1a1a1a"/><path class="rs-drawp" pathLength="1" d="M7.5 13l4 4 7-8.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     bang: '<svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 2c7 0 11 5 11 11s-5 11-11 11S2 19 2 13 7 2 14 2" fill="#fff" stroke="#1a1a1a" stroke-width="1.8"/><path d="M13 7.5v7M13 18v.5" stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round"/></svg>',
     warn: '<svg width="18" height="18" viewBox="0 0 22 22" aria-hidden="true"><path d="M11 2l9 17H2z" fill="#fff" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/><path d="M11 8v5M11 16v.5" stroke="#1a1a1a" stroke-width="2" stroke-linecap="round"/></svg>',
     info: '<svg width="18" height="18" viewBox="0 0 22 22" aria-hidden="true"><path d="M11 2c5 0 9 4 9 9s-4 9-9 9-9-4-9-9 4-9 10-9" fill="#fff" stroke="#1a1a1a" stroke-width="1.6"/><path d="M11 10v6M11 6.5v.5" stroke="#1a1a1a" stroke-width="2" stroke-linecap="round"/></svg>',
     shield: '<svg width="18" height="18" viewBox="0 0 22 22" aria-hidden="true"><path d="M11 2l8 3v6c0 5-4 8-8 9-4-1-8-4-8-9V5z" fill="#ececec" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/></svg>',
     err: '<svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 2c7 0 11 5 11 11s-5 11-11 11S2 19 2 13 7 2 14 2" fill="#1a1a1a"/><path d="M9 9l8 8M17 9l-8 8" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg>',
     note: '<svg width="30" height="30" viewBox="0 0 34 34" aria-hidden="true"><path d="M6 8c1-3 20-4 22-1s1 18-2 20-18 2-20-1-1-15 0-18z" fill="#ececec" stroke="#1a1a1a" stroke-width="1.8"/><path d="M11 14h12M11 19h9" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round"/></svg>',
-    five: '<svg width="58" height="46" viewBox="0 0 58 46" aria-hidden="true"><g fill="#fff" stroke="#1a1a1a" stroke-width="1.8"><rect x="4" y="2" width="26" height="32" rx="2" transform="rotate(-6 17 18)"/><rect x="10" y="4" width="26" height="32" rx="2" transform="rotate(-3 23 20)"/><rect x="16" y="6" width="26" height="32" rx="2"/><rect x="22" y="8" width="26" height="32" rx="2" transform="rotate(3 35 24)"/><rect x="28" y="10" width="26" height="32" rx="2" transform="rotate(5 41 26)"/></g><path d="M33 18h14M33 23h12M33 28h9" stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round" transform="rotate(5 41 26)"/></svg>',
-    two: '<svg width="58" height="46" viewBox="0 0 58 46" aria-hidden="true"><g fill="#fff" stroke="#1a1a1a" stroke-width="1.8"><rect x="12" y="4" width="26" height="32" rx="2" transform="rotate(-5 25 20)"/><rect x="22" y="8" width="26" height="32" rx="2" transform="rotate(4 35 24)"/></g><path d="M27 16h15M27 21h13M27 26h15M27 31h8" stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round" transform="rotate(4 35 24)"/></svg>',
-    tray: '<svg width="96" height="72" viewBox="0 0 96 72" aria-hidden="true"><path d="M30 6c1-2 30-3 32 0s2 34 0 36-30 2-32 0-1-34 0-36z" fill="#fff" stroke="#1a1a1a" stroke-width="2"/><path d="M37 16h18M37 22h14M37 28h17" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round"/><path d="M8 40l8 26h64l8-26" fill="#ececec" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round"/><path d="M8 40h22c1 6 4 9 18 9s17-3 18-9h22" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round"/><path d="M78 6v20M71 13l7-7 7 7" fill="none" stroke="#1a1a1a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    done: '<svg width="42" height="42" viewBox="0 0 44 44" aria-hidden="true"><path d="M22 6c9 0 16 7 16 16s-7 16-16 16S6 31 6 22 13 6 23 6" fill="#1a1a1a"/><path d="M14 22l6 6 11-12" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 1v3M40 8l-2 2M43 22h-3M4 8l2 2M1 22h3" stroke="#1a1a1a" stroke-width="2" stroke-linecap="round"/></svg>',
-    undo: '<svg width="16" height="15" viewBox="0 0 18 16" aria-hidden="true"><path d="M6 2L2 6l4 4M2 6h9a5 5 0 0 1 0 10H8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    dl: '<svg width="14" height="16" viewBox="0 0 16 18" aria-hidden="true"><path d="M8 2v10M4 8l4 4 4-4M2 16h12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    five: '<svg width="58" height="46" viewBox="0 0 58 46" aria-hidden="true"><g fill="#fff" stroke="#1a1a1a" stroke-width="1.8"><g class="rs-pg rs-pg1"><rect x="4" y="2" width="26" height="32" rx="2" transform="rotate(-6 17 18)"/></g><g class="rs-pg rs-pg2"><rect x="10" y="4" width="26" height="32" rx="2" transform="rotate(-3 23 20)"/></g><g class="rs-pg rs-pg3"><rect x="16" y="6" width="26" height="32" rx="2"/></g><g class="rs-pg rs-pg4"><rect x="22" y="8" width="26" height="32" rx="2" transform="rotate(3 35 24)"/></g><g class="rs-pg rs-pg5"><rect x="28" y="10" width="26" height="32" rx="2" transform="rotate(5 41 26)"/><path d="M33 18h14M33 23h12M33 28h9" stroke-width="1.6" stroke-linecap="round" transform="rotate(5 41 26)"/></g></g></svg>',
+    magic: '<svg width="58" height="46" viewBox="0 0 58 46" aria-hidden="true"><g class="rs-cube" fill="#fff" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"><path d="M8 18l14-7 14 7v16l-14 7-14-7z"/><path d="M8 18l14 7 14-7M22 25v16"/></g><g class="rs-orbit"><path d="M38 14c6-6 12-4 14 2" fill="none" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round"/><path d="M49 11l3 5-6 1" fill="none" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></g><path class="rs-spark" d="M44 30l1.5 4 4 1.5-4 1.5-1.5 4-1.5-4-4-1.5 4-1.5z" fill="#1a1a1a"/></svg>',
+    two: '<svg width="58" height="46" viewBox="0 0 58 46" aria-hidden="true"><g fill="#fff" stroke="#1a1a1a" stroke-width="1.8"><g class="rs-pt rs-pt1"><rect x="12" y="4" width="26" height="32" rx="2" transform="rotate(-5 25 20)"/></g><g class="rs-pt rs-pt2"><rect x="22" y="8" width="26" height="32" rx="2" transform="rotate(4 35 24)"/><path fill="none" d="M27 16h15M27 21h13M27 26h15M27 31h8" stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round" transform="rotate(4 35 24)"/></g></g></svg>',
+    tray: '<svg width="96" height="72" viewBox="0 0 96 72" aria-hidden="true"><g class="rs-dz-paper"><path d="M30 6c1-2 30-3 32 0s2 34 0 36-30 2-32 0-1-34 0-36z" fill="#fff" stroke="#1a1a1a" stroke-width="2"/><path d="M37 16h18M37 22h14M37 28h17" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round"/></g><path d="M8 40l8 26h64l8-26" fill="#ececec" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round"/><path d="M8 40h22c1 6 4 9 18 9s17-3 18-9h22" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round"/><g class="rs-dz-arrow"><path d="M78 6v20M71 13l7-7 7 7" fill="none" stroke="#1a1a1a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></g></svg>',
+    done: '<svg width="42" height="42" viewBox="0 0 44 44" aria-hidden="true"><path d="M22 6c9 0 16 7 16 16s-7 16-16 16S6 31 6 22 13 6 23 6" fill="#1a1a1a"/><path class="rs-drawp" pathLength="1" d="M14 22l6 6 11-12" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 1v3M40 8l-2 2M43 22h-3M4 8l2 2M1 22h3" stroke="#1a1a1a" stroke-width="2" stroke-linecap="round"/></svg>',
+    undo: '<svg class="rs-undo-ic" width="16" height="15" viewBox="0 0 18 16" aria-hidden="true"><path d="M6 2L2 6l4 4M2 6h9a5 5 0 0 1 0 10H8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    dl: '<svg class="rs-dl-ic" width="14" height="16" viewBox="0 0 16 18" aria-hidden="true"><path d="M8 2v10M4 8l4 4 4-4M2 16h12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     up: '<svg width="13" height="9" viewBox="0 0 14 10" aria-hidden="true"><path d="M2 8l5-6 5 6" fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     down: '<svg width="13" height="9" viewBox="0 0 14 10" aria-hidden="true"><path d="M2 2l5 6 5-6" fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    spin: '<svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 1-7.3 5.8" fill="none" stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round"/></svg>',
     hx: '<svg width="11" height="11" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2l10 10M12 2L2 12" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/></svg>',
     hok: '<svg width="12" height="12" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7.5l3.5 3.5L12 3" fill="none" stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     // Author links — official LinkedIn / GitHub / Figma marks (Simple Icons, CC0), in greyscale.
@@ -2362,6 +2517,149 @@
     if (UI.links) UI.links.hidden = !_linksOn;
   }
   function svgEl(markup) { var t = document.createElement("span"); t.innerHTML = markup; return t.firstChild; }
+
+  // ---- FX: bursts, confetti, flying files, wake-ups. Purely decorative: every
+  // call is guarded, does nothing under reduced-motion, and can never throw
+  // into the feature code that calls it.
+  var FX = (function () {
+    var lastCta = null;
+    function on() { try { return !!(UI.root && !reduceMotion() && document.body.animate); } catch (e) { return false; } }
+    function layer() {
+      var r = UI.root; if (!r) return null;
+      var l = r.querySelector(".rs-fx");
+      if (!l) { l = document.createElement("div"); l.className = "rs-fx"; l.setAttribute("aria-hidden", "true"); }
+      if (r.lastChild !== l) r.appendChild(l);   // keep it above the panel and toasts
+      return l;
+    }
+    function play(node, kf, opt, after) {
+      var a = null, done = false;
+      var fin = function () { if (done) return; done = true; try { after && after(); } catch (e) {} };
+      try { a = node.animate(kf, opt); } catch (e) {}
+      if (!a) { fin(); return a; }
+      a.onfinish = fin; a.oncancel = fin;
+      // Safety net: a background/throttled tab may never fire onfinish — never leave a decorative node behind.
+      if (after && opt && isFinite(opt.iterations === undefined ? 1 : opt.iterations)) setTimeout(fin, (+opt.duration || 0) * (opt.iterations || 1) + (+opt.delay || 0) + 400);
+      return a;
+    }
+    function burst(x, y, color, n) {
+      if (!on()) return; var L = layer(); if (!L) return;
+      n = n || 9;
+      for (var i = 0; i < n; i++) {
+        var d = document.createElement("i"); d.className = "rs-fx-ray";
+        d.style.left = x + "px"; d.style.top = y + "px"; if (color) d.style.background = color;
+        L.appendChild(d);
+        var ang = (360 / n) * i + (Math.random() * 18 - 9), r0 = 8, r1 = 20 + Math.random() * 12;
+        (function (dd) {
+          play(dd, [
+            { transform: "translate(-50%,-50%) rotate(" + ang + "deg) translateY(-" + r0 + "px) scaleY(.3)", opacity: 1 },
+            { transform: "translate(-50%,-50%) rotate(" + ang + "deg) translateY(-" + r1 + "px) scaleY(1)", opacity: 0 }
+          ], { duration: 430 + Math.random() * 140, easing: "cubic-bezier(.16,1,.3,1)" }, function () { dd.remove(); });
+        })(d);
+      }
+    }
+    var STAR = '<svg viewBox="0 0 10 10" width="11" height="11"><path d="M5 0l1.2 3.8L10 5 6.2 6.2 5 10 3.8 6.2 0 5l3.8-1.2z" fill="currentColor"/></svg>';
+    var SQUIG = '<svg viewBox="0 0 16 6" width="16" height="6"><path d="M1 4c2-3 4 2 7 0s4-3 7 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    function confetti(x, y, n, power) {
+      if (!on()) return; var L = layer(); if (!L) return;
+      n = n || 30; power = power || 1;
+      var shapes = ["rect", "dot", "star", "squig"], cols = ["#1a1a1a", "#4d4d4d", "#8a8a8a", "#cfcfcf", "#22c55e", "#1a1a1a"];
+      for (var i = 0; i < n; i++) {
+        var sh = shapes[i % 4], c = cols[Math.floor(Math.random() * cols.length)];
+        var p = document.createElement("i"); p.className = "rs-fx-bit rs-fx-" + sh;
+        if (sh === "star" || sh === "squig") { p.style.color = c; p.innerHTML = sh === "star" ? STAR : SQUIG; } else p.style.background = c;
+        p.style.left = x + "px"; p.style.top = y + "px"; L.appendChild(p);
+        var ang = (-90 + (Math.random() * 150 - 75)) * Math.PI / 180, v = (150 + Math.random() * 190) * power;
+        var vx = Math.cos(ang) * v, vy = Math.sin(ang) * v, g = 620, T = 1.05 + Math.random() * .6, rot = Math.random() * 900 - 450, kf = [];
+        for (var k = 0; k <= 8; k++) {
+          var t = T * k / 8, px = vx * t * (1 - .25 * k / 8), py = vy * t + .5 * g * t * t;
+          kf.push({ transform: "translate(" + px.toFixed(1) + "px," + py.toFixed(1) + "px) rotate(" + (rot * k / 8).toFixed(0) + "deg) scale(" + (k === 0 ? .4 : 1) + ")", opacity: k < 6 ? 1 : (k === 6 ? .85 : (k === 7 ? .5 : 0)) });
+        }
+        (function (pp) { play(pp, kf, { duration: T * 1000, easing: "linear" }, function () { pp.remove(); }); })(p);
+      }
+    }
+    function noteCta(elm) {
+      try { var r = elm.getBoundingClientRect(); lastCta = { x: r.left + r.width / 2, y: r.top + r.height / 2, t: Date.now() }; } catch (e) {}
+    }
+    function gulp() {
+      if (!UI.launcher) return;
+      play(UI.launcher, [{ transform: "scale(1)" }, { transform: "scale(1.22,.82)" }, { transform: "scale(.92,1.1)" }, { transform: "scale(1.04,.97)" }, { transform: "scale(1)" }], { duration: 520, easing: "ease-out" });
+    }
+    function fly() {
+      if (!on() || !UI.launcher) return;
+      var a = lastCta; lastCta = null;
+      if (!a || Date.now() - a.t > 15000) return;
+      var L = layer(); if (!L) return;
+      var b = UI.launcher.getBoundingClientRect();
+      var d = document.createElement("i"); d.className = "rs-fx-file"; d.innerHTML = IC.note;
+      d.style.left = (a.x - 15) + "px"; d.style.top = (a.y - 15) + "px"; L.appendChild(d);
+      var dx = b.left + b.width / 2 - a.x, dy = b.top + b.height / 2 - a.y;
+      play(d, [
+        { transform: "translate(0,0) scale(.6) rotate(0deg)", opacity: 0 },
+        { transform: "translate(0,-14px) scale(1.15) rotate(-8deg)", opacity: 1, offset: .15 },
+        { transform: "translate(" + (dx * .5).toFixed(0) + "px," + (dy * .5 - 110).toFixed(0) + "px) scale(1.25) rotate(-28deg)", opacity: 1, offset: .55 },
+        { transform: "translate(" + dx.toFixed(0) + "px," + dy.toFixed(0) + "px) scale(.3) rotate(25deg)", opacity: .9 }
+      ], { duration: 820, easing: "cubic-bezier(.45,0,.55,1)" }, function () {
+        d.remove(); gulp();
+        var r = UI.launcher.getBoundingClientRect(); confetti(r.left + r.width / 2, r.top + 6, 14, .7);
+      });
+    }
+    function wake(btn) {
+      if (!on() || !btn) return;
+      play(btn, [{ transform: "scale(1)" }, { transform: "scale(1.08) rotate(-1.5deg)" }, { transform: "scale(.97) rotate(.5deg)" }, { transform: "scale(1)" }], { duration: 520, easing: "ease-out" });
+      btn.classList.remove("rs-shine"); void btn.offsetWidth; btn.classList.add("rs-shine");
+      setTimeout(function () { try { btn.classList.remove("rs-shine"); } catch (e) {} }, 800);
+    }
+    function celebrate(head, big) {
+      if (!on() || !head) return;
+      function wave(n, pw) {
+        try {
+          var sv = head.querySelector("svg"); if (!sv || !sv.isConnected) return;
+          var r = sv.getBoundingClientRect(); confetti(r.left + r.width / 2, r.top + r.height / 2, n, pw);
+        } catch (e) {}
+      }
+      setTimeout(function () { wave(big ? 56 : 40, big ? 1.35 : 1.15); }, big ? 900 : 420);
+      if (big) setTimeout(function () { wave(26, .9); }, 1250);
+    }
+    function fold(card) {
+      // Detach the closing panel from the live UI (no .rs-panel class, no ids) and fold it into the launcher.
+      try {
+        if (!on()) { card.remove(); return; }
+        var cs = getComputedStyle(card), r = card.getBoundingClientRect();
+        card.querySelectorAll("[id]").forEach(function (n) { n.removeAttribute("id"); });
+        card.removeAttribute("role"); card.setAttribute("aria-hidden", "true"); card.inert = true;
+        card.setAttribute("style", "position:fixed;margin:0;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;box-sizing:border-box;z-index:2147483646;overflow:hidden;display:flex;flex-direction:column;pointer-events:none;transform-origin:bottom right;" +
+          "background:" + cs.backgroundColor + ";border:" + cs.border + ";border-radius:" + cs.borderRadius + ";box-shadow:" + cs.boxShadow + ";font-family:" + cs.fontFamily + ";font-size:" + cs.fontSize + ";line-height:" + cs.lineHeight + ";color:" + cs.color);
+        card.className = "rs-leaving";
+        play(card, [{ opacity: 1, transform: "none" }, { opacity: .9, transform: "translate(-3px,-6px) scale(1.01) rotate(-.6deg)", offset: .25 }, { opacity: 0, transform: "translate(14px,46px) scale(.72) rotate(3deg)" }],
+          { duration: 300, easing: "cubic-bezier(.5,0,.75,0)" }, function () { card.remove(); });
+      } catch (e) { try { card.remove(); } catch (e2) {} }
+    }
+    function hello(b) {
+      if (!on() || !b) return;
+      setTimeout(function () { try { b.classList.add("rs-hello"); setTimeout(function () { b.classList.remove("rs-hello"); }, 1000); } catch (e) {} }, 700);
+    }
+    function portScene(srcName, dstName) {
+      var anim = on();
+      var cube = function (k) {
+        var begin = (k * 0.6).toFixed(1) + "s";
+        return '<g opacity="' + (anim ? 0 : 1) + '"' + (anim ? '' : ' transform="translate(160 22)"') + '><path d="M-7 -3l7-4 7 4v8l-7 4-7-4z" fill="#fff" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/><path d="M-7 -3l7 4 7-4M0 1v8" fill="none" stroke="#1a1a1a" stroke-width="1.3"/>' +
+          (anim ? '<animateMotion dur="1.8s" begin="' + begin + '" repeatCount="indefinite" path="M98 62 C140 -8 180 -8 222 62" keyPoints="0;1" keyTimes="0;1" calcMode="spline" keySplines=".45 0 .55 1"/>' +
+            '<animate attributeName="opacity" dur="1.8s" begin="' + begin + '" repeatCount="indefinite" values="0;1;1;0" keyTimes="0;.12;.86;1"/>' : '') + '</g>';
+      };
+      var card = function (x, label, cls) {
+        return '<g' + (cls ? ' class="' + cls + '"' : '') + '><path d="M' + x + ' 46c1-3 72-4 74 0s2 40 0 42-72 2-74 0-1-39 0-42z" fill="' + (cls ? '#fff' : '#f7f7f7') + '" stroke="#1a1a1a" stroke-width="2"/>' +
+          '<path d="M' + (x + 12) + ' 62h50M' + (x + 12) + ' 70h38M' + (x + 12) + ' 78h44" stroke="#cfcfcf" stroke-width="3" stroke-linecap="round"/>' +
+          '<text x="' + (x + 37) + '" y="104" text-anchor="middle" font-family="Verdana,Geneva,sans-serif" font-size="11" font-weight="bold" fill="#1a1a1a">' + esc(label) + '</text></g>';
+      };
+      return '<svg class="rs-port" viewBox="0 0 320 112" aria-hidden="true">' +
+        card(22, srcName, "") + card(224, dstName, "rs-port-dst") +
+        '<path class="rs-port-path" d="M98 62 C140 -8 180 -8 222 62" fill="none" stroke="#1a1a1a" stroke-width="1.8" stroke-linecap="round"/>' +
+        '<path class="rs-port-spark" d="M160 46l2 5 5 2-5 2-2 5-2-5-5-2 5-2z" fill="#1a1a1a"/>' +
+        '<path class="rs-port-spark s2" d="M196 14l1.4 3.4 3.4 1.4-3.4 1.4-1.4 3.4-1.4-3.4-3.4-1.4 3.4-1.4z" fill="#22c55e"/>' +
+        cube(0) + (anim ? cube(1) + cube(2) : '') + '</svg>';
+    }
+    return { on: on, burst: burst, confetti: confetti, fly: fly, noteCta: noteCta, wake: wake, celebrate: celebrate, fold: fold, hello: hello, portScene: portScene, gulp: gulp };
+  })();
 
 
   var panel = null;        // the scrollable content body of the current panel
@@ -2386,7 +2684,7 @@
   function ensureHost() {
     if (UI.root) return UI.root;
     var host = document.createElement("div");
-    host.id = "ringg-studio-host";
+    host.id = "promptport-host";
     try { host.style.all = "initial"; } catch (e) {}
     var root = host.attachShadow({ mode: "open" });
     var st = document.createElement("style");
@@ -2394,6 +2692,14 @@
     root.appendChild(st);
     document.body.appendChild(host);
     UI.host = host; UI.root = root;
+    root.addEventListener("pointerdown", function (e) {
+      try {
+        var t = e.target && e.target.closest && e.target.closest(".rs-btn,.rs-cta,.rs-tab,.rs-launcher,.rs-check,.rs-linkic,.rs-dropzone,.rs-textbtn,.rs-x,.rs-choice");
+        if (!t || t.disabled || t.getAttribute("aria-disabled") === "true") return;
+        if (t.classList.contains("rs-cta")) FX.noteCta(t);
+        FX.burst(e.clientX, e.clientY, null, t.classList.contains("rs-cta") || t.classList.contains("rs-btn-primary") ? 11 : 8);
+      } catch (err) {}
+    }, true);
     return root;
   }
 
@@ -2428,7 +2734,7 @@
       if (UI.card) closePanel(e.detail === 0);
       else {
         openPanel();
-        if (e.detail === 0) setTimeout(function () { var a = UI.root.querySelector(".rs-tab.active"); if (a) a.focus(); }, 0);
+        if (e.detail === 0) setTimeout(function () { var a = UI.card && UI.card.querySelector(".rs-tab.active"); if (a) a.focus(); }, 0);
       }
       resetTuckTimer();
     });
@@ -2436,6 +2742,7 @@
     b.addEventListener("mouseenter", function () { resetTuckTimer(); });
     root.appendChild(b);
     UI.launcher = b;
+    FX.hello(b);
     resetTuckTimer(); // start the 7s countdown; it tucks if left idle
   }
 
@@ -2448,8 +2755,12 @@
   // finishes) · close. No product name or logo.
   function shell(active) {
     var root = ensureHost();
-    if (UI.card && UI.card.parentNode) UI.card.parentNode.removeChild(UI.card);
-    var card = el("div", "rs-panel rs-enter"); UI.card = card;
+    var wasOpen = !!(UI.card && UI.card.parentNode);
+    var tabChanged = !wasOpen || currentTab !== active;
+    var TAB_ORDER = ["export", "import", "find"];
+    var prevIdx = wasOpen ? TAB_ORDER.indexOf(currentTab) : -1, newIdx = TAB_ORDER.indexOf(active);
+    if (wasOpen) UI.card.parentNode.removeChild(UI.card);
+    var card = el("div", "rs-panel " + (wasOpen ? "rs-swap" : "rs-enter") + (wasOpen && tabChanged && prevIdx >= 0 && newIdx >= 0 ? (newIdx > prevIdx ? " rs-dir-r" : " rs-dir-l") : "")); UI.card = card;
     card.setAttribute("role", "dialog"); card.setAttribute("aria-label", "PromptPort");
     if (UI.launcher) UI.launcher.setAttribute("aria-expanded", "true");
 
@@ -2478,13 +2789,15 @@
     function activate(i, kb) {
       UI._kbTab = !!kb;
       TABS[i][2]();
-      if (kb) setTimeout(function () { var a = UI.root && UI.root.querySelector(".rs-tab.active"); if (a) a.focus(); }, 0);
+      if (kb) setTimeout(function () { var a = UI.card && UI.card.querySelector(".rs-tab.active"); if (a) a.focus(); }, 0);
       if (kb) setTimeout(function () { UI._kbTab = false; }, 120);
       else UI._kbTab = false;
     }
     TABS.forEach(function (t, i) {
         var on = t[0] === active;
-        var b = el("button", "rs-tab" + (on ? " active" : ""), t[1]);
+        var sliding = on && wasOpen && tabChanged && prevIdx >= 0;
+        var b = el("button", "rs-tab" + (on ? " active" + (sliding ? " rs-slide" : (tabChanged ? " rs-fresh" : "")) : ""), t[1]);
+        if (sliding) b.style.setProperty("--rs-from", (((prevIdx - i) / 0.6) * 100).toFixed(1) + "%");
         b.id = "rs-tab-" + t[0];
         b.setAttribute("role", "tab"); b.setAttribute("aria-selected", on ? "true" : "false");
         b.setAttribute("aria-controls", "rs-tabpanel"); b.tabIndex = on ? 0 : -1;
@@ -2526,7 +2839,7 @@
 
   function closePanel(returnFocus) {
     var hadFocus = !!(UI.card && UI.root && UI.root.activeElement && UI.card.contains(UI.root.activeElement));
-    if (UI.card && UI.card.parentNode) UI.card.parentNode.removeChild(UI.card);
+    if (UI.card && UI.card.parentNode) FX.fold(UI.card);
     UI.card = null; panel = null; currentTab = null; UI.links = null;
     if (UI.launcher) UI.launcher.setAttribute("aria-expanded", "false");
     if ((returnFocus === true || hadFocus) && UI.launcher) { try { UI.launcher.focus(); } catch (e) {} }
@@ -2553,6 +2866,7 @@
   function toastKind(msg) { return /^(Couldn't|Can't|No |Nothing|Already|Clicked Save)| 0 fields /.test(String(msg)) ? "info" : "ok"; }
   function toast(msg, undoFn, kind) {
     kind = kind || toastKind(msg);
+    try { if (/ZIP downloaded|Backup downloaded/.test(String(msg))) FX.fly(); } catch (e) {}
     var root = ensureHost();
     var wrap = root.querySelector(".rs-toasts");
     if (!wrap) { wrap = el("div", "rs-toasts"); wrap.setAttribute("role", "status"); wrap.setAttribute("aria-live", "polite"); root.appendChild(wrap); }
@@ -2663,7 +2977,7 @@
     ["5-bucket ZIP", "2-bucket ZIP", "single .md"].forEach(function (t) { pills.appendChild(el("span", "rs-pill", t)); });
     body.appendChild(pills);
     body.appendChild(callout("info", null,
-      (isGorezolv()
+      (isTwoField()
         ? "A 5-bucket ZIP is combined into Main Prompt under # headings; a 2-bucket ZIP goes in as is."
         : "A 2-bucket ZIP's Main Prompt is split into the 4 buckets by its # headings; a 5-bucket ZIP goes in file by file.") +
       " You'll see every change and confirm before anything is overwritten."));
@@ -2721,7 +3035,7 @@
   async function peekMagicPort(arrayBuffer) {
     if (!window.MagicPort) return null;
     var entries;
-    try { entries = await window.RinggUnzip.read(arrayBuffer); } catch (e) { return null; }
+    try { entries = await window.PPUnzip.read(arrayBuffer); } catch (e) { return null; }
     var names = [].map.call(entries, function (f) { return f.name; });
     if (!window.MagicPort.isMagicPortZip(names)) return null;
     var cfgEntry = [].slice.call(entries).filter(function (f) { return /(^|\/)magicport\.json$/i.test(f.name); })[0];
@@ -2731,15 +3045,46 @@
     return { config: config, names: names };
   }
 
+  // Analysis keys with their source type and the type they will be created as on
+  // this dashboard. Types matter (a Number key written as String breaks reporting),
+  // so the mapping is shown BEFORE migrating, and any key whose type cannot be
+  // matched exactly is called out in a warning that cannot be collapsed away.
+  function mpKeyTypeTable(keys) {
+    var wrap = el("div", "rs-mp-keys");
+    var cap = function (t) { t = String(t == null ? "" : t).trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : "String"; };
+    var rows = keys.map(function (k) { var m = window.MagicPort.mapKeyTypeDash5ToDash2(k.type); return { name: k.name, from: cap(k.type), to: m.type, flagged: m.flagged, why: m.why }; });
+    var flagged = rows.filter(function (r) { return r.flagged; });
+    var tally = {}; rows.forEach(function (r) { tally[r.to] = (tally[r.to] || 0) + 1; });
+    if (flagged.length) {
+      wrap.appendChild(callout("warn", flagged.length + " analysis key type" + (flagged.length > 1 ? "s" : "") + " can't be matched exactly",
+        flagged.map(function (r) { return r.name + ": " + r.from + " → String (" + (r.why || "no matching type") + ")"; }).join("; ") + ". Check these after migrating."));
+    }
+    var det = document.createElement("details"); det.className = "rs-mp-keys-d";
+    if (flagged.length || rows.length <= 8) det.open = true;
+    var sum = document.createElement("summary");
+    sum.textContent = "Analysis keys & types (" + rows.length + ") — " + Object.keys(tally).map(function (t) { return tally[t] + " " + t; }).join(" · ");
+    det.appendChild(sum);
+    var tb = el("div", "rs-mp-keys-t");
+    rows.forEach(function (r) {
+      var line = el("div", "rs-mp-key" + (r.flagged ? " flag" : ""));
+      line.appendChild(el("span", "rs-mp-key-n", r.name));
+      var changed = r.from.toLowerCase() !== r.to.toLowerCase();
+      line.appendChild(el("span", "rs-mp-key-t", changed ? (r.from + " → " + r.to) : r.to));
+      tb.appendChild(line);
+    });
+    det.appendChild(tb); wrap.appendChild(det);
+    return wrap;
+  }
+
   // A red consent block (checkbox + message). Returns { wrap, checkbox }.
   function mpConsentBlock(innerHtml) {
-    var wrap = el("div", "rs-mp-consent");
-    wrap.setAttribute("style", "display:flex;gap:10px;align-items:flex-start;margin-top:12px;padding:12px;border:1.5px solid #b91c1c;border-radius:10px;background:rgba(185,28,28,0.06);");
+    var wrap = el("div", "rs-callout rs-mp-consent");
     var cb = document.createElement("input");
     cb.type = "checkbox"; cb.className = "rs-mp-consent-cb";
-    cb.setAttribute("style", "margin-top:2px;width:16px;height:16px;flex:0 0 auto;cursor:pointer;");
+    cb.checked = false; // never pre-ticked: the user must tick it themselves
+    cb.setAttribute("style", "margin:1px 0 0;width:18px;height:18px;flex:0 0 auto;cursor:pointer;accent-color:#22c55e;");
     var txt = el("label", "rs-mp-consent-text");
-    txt.setAttribute("style", "font-size:12.5px;line-height:1.45;cursor:pointer;");
+    txt.setAttribute("style", "cursor:pointer;");
     txt.innerHTML = innerHtml;
     var id = "rs-mp-consent-" + Date.now() + "-" + Math.floor(Math.random() * 1e4);
     cb.id = id; txt.setAttribute("for", id);
@@ -2750,8 +3095,14 @@
   // Wire a button so it's gated by a consent checkbox: looks disabled until
   // checked; a click while unchecked wiggles the consent block.
   function mpWireConsentGate(consentEl, checkbox, btn, proceedFn) {
+    var wasOn = false;
     function sync() {
       var on = checkbox.checked;
+      if (on && !wasOn) {
+        try { var cr = checkbox.getBoundingClientRect(); FX.burst(cr.left + cr.width / 2, cr.top + cr.height / 2, "#22c55e", 12); } catch (e) {}
+        setTimeout(function () { FX.wake(btn); }, 120);
+      }
+      wasOn = on;
       btn.setAttribute("aria-disabled", on ? "false" : "true");
       btn.style.opacity = on ? "" : "0.45";
       btn.style.cursor = on ? "" : "not-allowed";
@@ -2763,13 +3114,16 @@
            { transform: "translateX(-5px)" }, { transform: "translateX(5px)" }, { transform: "translateX(0)" }],
           { duration: 420, easing: "ease-in-out" });
         var ob = node.style.borderColor; node.style.borderColor = "#ef4444";
-        setTimeout(function () { node.style.borderColor = ob || "#b91c1c"; }, 500);
+        setTimeout(function () { node.style.borderColor = ob || ""; }, 500);
       } catch (e) {}
       try { node.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) {}
     }
     checkbox.addEventListener("change", sync); sync();
+    var fired = false;   // a double/triple click must never start the action twice
     btn.addEventListener("click", function () {
       if (!checkbox.checked) { wiggle(consentEl); try { checkbox.focus(); } catch (e) {} return; }
+      if (fired) return;
+      fired = true;
       proceedFn();
     });
   }
@@ -2780,14 +3134,15 @@
     freshPanel("Magic Port — import");
     var d = config.data || {};
     var dest = window.MagicPort.hostPlatform();
-    var srcP = (config.source && config.source.platform) || "?";
-    panel.appendChild(callout("info", "Migrate a full bot onto this " + (dest === "rezolv" ? "Rezolv" : "Ringg") + " bot",
-      "Source: " + (config.source && config.source.botName ? config.source.botName : "(unnamed)") + " [" + srcP + "]."));
+    panel.appendChild(callout("info", "Migrate a full bot onto this bot",
+      "Source: " + (config.source && config.source.botName ? config.source.botName : "(unnamed)") + "."));
     var ul = el("div", "rs-note");
     function line(txt) { panel.appendChild(lineRow("•", null, txt)); }
     line((d.variables || []).length + " custom variables");
     line(((d.customAnalysis && d.customAnalysis.keys) || []).length + " custom-analysis keys" + (d.customAnalysis && d.customAnalysis.prompt ? " + analysis prompt" : ""));
     line((d.events || []).length + " event subscription(s)");
+    var anKeys = (d.customAnalysis && d.customAnalysis.keys) || [];
+    if (anKeys.length && dest === window.MagicPort.DASH2) panel.appendChild(mpKeyTypeTable(anKeys));
     var toolN = 0; ["pre_call", "on_call", "post_call"].forEach(function (p) { toolN += ((d.tools || {})[p] || []).length; });
     line(toolN + " tool(s)");
     line("prompt (" + ((d.promptFiles || []).length) + " file(s)) + language/voice");
@@ -2803,7 +3158,6 @@
         npTools.map(function (t) { return (t.name || "tool") + " (" + (t.toolType || "non-API") + ")"; }).join(", ") +
         ". Everything else above migrates normally."));
     }
-    panel.appendChild(callout("info", "Order & safety", "Runs variables → tools → prompt → language/voice → analysis → events, saving each section, then a final page Save. A backup of this bot's prompt fields is taken first. If the session drops, it stops and reports where it got to."));
 
     // ---- required consent (import OVERWRITES everything on this bot) --------
     var c = mpConsentBlock(
@@ -2811,9 +3165,9 @@
     panel.appendChild(c.wrap);
 
     var foot = footer();
-    var row = el("div", "rs-ctas");
-    var go = el("button", "rs-btn rs-cta rs-cta-magic"); go.appendChild(el("span", "rs-cta-l", "Migrate"));
-    var cancel = el("button", "rs-btn rs-btn-ghost"); cancel.appendChild(el("span", null, "Cancel"));
+    var row = el("div", "rs-row");
+    var go = el("button", "rs-btn rs-btn-primary", "Migrate");
+    var cancel = el("button", "rs-btn rs-btn-ghost", "Cancel");
     mpWireConsentGate(c.wrap, c.checkbox, go, function () {
       go.setAttribute("aria-disabled", "true"); go.style.opacity = "0.45"; go.style.cursor = "not-allowed";
       runMagicPortImport(config, arrayBuffer);
@@ -2827,8 +3181,13 @@
   // existing prompt pipeline (resolveImportPlan -> runImport).
   async function runMagicPortImport(config, arrayBuffer) {
     freshPanel("Magic Port — migrating…");
-    var status = el("div", "rs-note", "Writing sections… do not navigate away.");
+    var status = el("div", "rs-note rs-working");
+    status.innerHTML = IC.spin + "<span>Writing sections… do not navigate away.</span>";
     status.setAttribute("aria-live", "polite");
+    try {
+      var scene = el("div"); scene.innerHTML = FX.portScene("Source bot", "This bot");
+      panel.appendChild(scene);
+    } catch (e) {}
     panel.appendChild(status);
 
     // backup current prompt fields (reuse the existing undo snapshot)
@@ -2896,35 +3255,40 @@
       if (!r.ok || items.length) {
         var why = r.reason === "auth-redirect" ? "session expired (logged out) — stopped here"
                 : (r.reason && /TODO@LIVE/.test(r.reason)) ? "not available in this build yet"
-                : (r.wrong && r.wrong.length) ? ("wrong type: " + r.wrong.map(function (w) { return w.name; }).join(", "))
+                : (r.wrong && r.wrong.length) ? ("type check failed: " + r.wrong.map(function (w) { return w.reason === "missing" ? (w.name + " (not found)") : (w.name + " (wanted " + w.want + ", got " + w.got + ")"); }).join(", "))
                 : (items.length ? "" : (r.reason || "failed"));
         var uniq = items.filter(function (v, idx) { return items.indexOf(v) === idx; });
         failures.push({ title: title, items: uniq, why: why });
       }
     });
+    // A run that stopped before importing anything (e.g. this dashboard isn't a
+    // supported destination) reports no per-section results — that is a failure,
+    // never "Porting Successful".
+    if (out && out.ok === false && !results.length) failures.push({ title: "Magic Port", items: [], why: out.reason || "the migration did not run" });
     var anyFail = failures.length > 0;
 
     // Happy path: everything imported → smiley + "Porting Successful", no consent.
     if (!anyFail) {
-      var smiley = '<svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-        '<circle cx="12" cy="12" r="9"></circle>' +
-        '<path d="M8 14.5a5 5 0 0 0 8 0"></path>' +
+      var smiley = '<svg class="rs-smile" width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<circle pathLength="1" cx="12" cy="12" r="9"></circle>' +
+        '<path pathLength="1" d="M8 14.5a5 5 0 0 0 8 0"></path>' +
         '<line x1="9" y1="9.5" x2="9" y2="10"></line>' +
         '<line x1="15" y1="9.5" x2="15" y2="10"></line></svg>';
       var wrap = el("div", "rs-mp-success");
       wrap.setAttribute("style", "display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:22px 8px;");
       var face = el("div"); face.innerHTML = smiley; wrap.appendChild(face);
+      FX.celebrate(face, true);
       wrap.appendChild(el("div", "rs-donehead-t", "Porting Successful"));
       wrap.appendChild(el("div", "rs-donehead-s", "The whole bot was imported and saved."));
       panel.appendChild(wrap);
       appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
-      addCloseRow();
       setLinks(true);
       return;
     }
 
     var head = el("div", "rs-donehead");
-    head.innerHTML = anyFail ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42"') : IC.done;
+    head.innerHTML = anyFail ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42" class="rs-shake"') : IC.done;
+    if (!anyFail) FX.celebrate(head);
     var ht = el("div");
     ht.appendChild(el("div", "rs-donehead-t", anyFail ? (okN ? "Migrated with failures" : "Migration did not complete") : "Migration complete"));
     ht.appendChild(el("div", "rs-donehead-s", anyFail ? "Some items were NOT imported — review the list below." : "Everything was imported and saved."));
@@ -2969,9 +3333,11 @@
       var c = mpConsentBlock("I have reviewed the items above that were <b>not imported</b> and understand they were left out. I'll handle them manually if needed.");
       panel.appendChild(c.wrap);
       var foot = footer();
-      var closeBtn = el("button", "rs-btn rs-cta"); closeBtn.appendChild(el("span", "rs-cta-l", "Close"));
+      var closeRow = el("div", "rs-row");
+      var closeBtn = el("button", "rs-btn rs-btn-primary", "Close");
       mpWireConsentGate(c.wrap, c.checkbox, closeBtn, function () { closePanel(); });
-      foot.appendChild(closeBtn);
+      closeRow.appendChild(closeBtn);
+      foot.appendChild(closeRow);
     } else {
       addCloseRow();
     }
@@ -3001,9 +3367,9 @@
     clearTimeout(_tuckTimer);
     askInterceptorForLatest();
     var myGen = ++opGen;
-    // Ringg needs 3 passes (buckets render late / start collapsed); the Rezolv
+    // Dash5 needs 3 passes (buckets render late / start collapsed); the Dash2
     // panel's two fields are always on screen, so one pass is enough.
-    var PASSES = isGorezolv() ? 1 : 3;
+    var PASSES = isTwoField() ? 1 : 3;
     if (thenDownloadFormat) _exportBusy = true;
     _lastDl = null; setLinks(false);   // a new activity started
     // Repaint only while the panel is open: closing it mid-way lets the read
@@ -3040,10 +3406,10 @@
     opts = opts || {};
     var idle = !!opts.idle;
     var loading = !sections && !idle;
-    var gz = isGorezolv();
+    var gz = isTwoField();
     var baseSecs = gz
       ? [{ title: "First Message" }, { title: "Main Prompt" }]
-      : window.RinggExtract.SECTIONS;
+      : window.PPExtract.SECTIONS;
     var secList = sections || baseSecs.map(function (s) {
       return { title: s.title, text: "", source: "none" };
     });
@@ -3152,9 +3518,10 @@
     // Magic Port: the third export CTA (full-width), downloads the whole bot
     // (prompt + all configurations) as one ZIP for migration to another bot.
     if (window.MagicPort) {
-      var mpBtn = el("button", "rs-btn rs-cta rs-cta-magic");
+      var mpBtn = el("button", "rs-btn rs-cta rs-cta-magic rs-cta-wide");
+      mpBtn.innerHTML = IC.magic;
       mpBtn.appendChild(el("span", "rs-cta-l", enabled ? "Magic Port" : "Preparing…"));
-      mpBtn.setAttribute("data-sub", enabled ? "full bot: prompt + configs" : "");
+      mpBtn.setAttribute("data-sub", enabled ? "· full bot: prompt + configs" : "");
       mpBtn.disabled = !enabled;
       mpBtn.title = "Download the entire bot (prompt, variables, language/voice, analysis, tools, event subscriptions) as one ZIP to import onto another bot.";
       mpBtn.addEventListener("click", function () { if (!mpBtn.disabled) refreshExport("magic"); });
@@ -3213,11 +3580,11 @@
     h.appendChild(t);
   }
 
-  // While the idle Export view is open on the Rezolv panel, re-check Main Prompt
+  // While the idle Export view is open on the Dash2 panel, re-check Main Prompt
   // as the user edits it, so "Download 5 Buckets" turns on/off live.
   var _fiveRecheckT = null;
   document.addEventListener("input", function () {
-    if (!isGorezolv() || !UI.card || currentTab !== "export" || !UI.fiveBtn) return;
+    if (!isTwoField() || !UI.card || currentTab !== "export" || !UI.fiveBtn) return;
     clearTimeout(_fiveRecheckT);
     _fiveRecheckT = setTimeout(function () {
       if (!UI.fiveBtn) return;
@@ -3235,7 +3602,7 @@
 
   // ---- import panels ------------------------------------------------------
   function freshPanel(titleText) {
-    var a = /find/i.test(titleText) ? "find" : (/import/i.test(titleText) ? "import" : "export");
+    var a = /find/i.test(titleText) ? "find" : (/import|magic port/i.test(titleText) ? "import" : "export");
     return shell(a);
   }
 
@@ -3312,7 +3679,7 @@
       det.appendChild(document.createTextNode(" "));
       det.appendChild(el("span", "rs-pill", plan.detected));
       det.appendChild(document.createTextNode(" → "));
-      det.appendChild(el("span", "rs-pill", isGorezolv() ? "First Message + Main Prompt" : "5 buckets"));
+      det.appendChild(el("span", "rs-pill", isTwoField() ? "First Message + Main Prompt" : "5 buckets"));
       panel.appendChild(det);
     }
     // A field is "same" when the file's text equals what's on the page now —
@@ -3340,7 +3707,7 @@
     var row = el("div", "rs-row");
     if (!plan.matched.length) {
       foot.appendChild(callout("bad", null, "Nothing in this file matched " +
-        (isGorezolv() ? "First Message / Main Prompt" : "the five buckets") + ". Check the file names."));
+        (isTwoField() ? "First Message / Main Prompt" : "the five buckets") + ". Check the file names."));
     } else if (!changedN) {
       foot.appendChild(callout("info", null, "Nothing to change — every field already matches the file."));
     } else {
@@ -3410,8 +3777,8 @@
     foot.appendChild(row);
   }
 
-  // ---- Save to Ringg (clicks Ringg's own top-right Save button) -----------
-  function findRinggSaveButton() {
+  // ---- Save to Dash5 (clicks Dash5's own top-right Save button) -----------
+  function findDash5SaveButton() {
     var btns = [].slice.call(document.querySelectorAll("button, [role='button']"));
     var cands = btns.filter(function (b) {
       var tx = (b.textContent || "").replace(/\s+/g, " ").trim();
@@ -3420,7 +3787,7 @@
       return r.width > 0 && r.height > 0;
     });
     if (!cands.length) return null;
-    // Prefer the top-most, then right-most (Ringg's Save sits top-right).
+    // Prefer the top-most, then right-most (Dash5's Save sits top-right).
     cands.sort(function (a, b) {
       var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
       return (ra.top - rb.top) || (rb.left - ra.left);
@@ -3428,15 +3795,15 @@
     return cands[0];
   }
   function isBtnDisabled(b) { return !b || b.disabled || b.getAttribute("aria-disabled") === "true"; }
-  function saveToRingg() {
-    var btn = findRinggSaveButton();
+  function saveToDash5() {
+    var btn = findDash5SaveButton();
     if (!btn) { toast("Couldn't find the page's Save button — please Save on the page."); return; }
     if (isBtnDisabled(btn)) { toast("Nothing to save — the page shows no unsaved changes."); return; }
     try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
     btn.click();
     toast("Saving…");
     setTimeout(function () {
-      var after = findRinggSaveButton();
+      var after = findDash5SaveButton();
       toast(isBtnDisabled(after) ? "Saved." : "Clicked Save — please confirm on the page.");
     }, 700);
   }
@@ -3447,7 +3814,8 @@
     var okN = results.filter(function (r) { return r.ok && !r.skipped; }).length;
     var badN = results.filter(function (r) { return !r.ok; }).length;
     var head = el("div", "rs-donehead");
-    head.innerHTML = badN && !okN ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42"') : IC.done;
+    head.innerHTML = badN && !okN ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42" class="rs-shake"') : IC.done;
+    if (!badN && okN && !opts.undone) FX.celebrate(head);
     var ht = el("div");
     ht.appendChild(el("div", "rs-donehead-t", opts.undone ? (okN ? "Restored on the page" : "Nothing was restored")
       : (okN ? "Written into the page" : (badN ? "Nothing was written" : "Nothing changed"))));
@@ -3660,7 +4028,7 @@
           result.appendChild(el("div", "rs-muted", "Review the fields, then Save. (Replace edits the stored text; a variable chip keeps its own name.)"));
           var srow = el("div", "rs-row");
           var sbtn = el("button", "rs-btn rs-btn-primary", "Save on page");
-          sbtn.addEventListener("click", saveToRingg);
+          sbtn.addEventListener("click", saveToDash5);
           srow.appendChild(sbtn); result.appendChild(srow);
         }
         repBtn.disabled = false; repBtn.textContent = "Replace all";
@@ -3700,11 +4068,11 @@
       askInterceptorForLatest();
       var found;
       try {
-        if (isGorezolv()) {
-          var gm = gorezolvEditors();
+        if (isTwoField()) {
+          var gm = twoFieldEditors();
           found = [{ title: "First Message", found: !!gm.fm }, { title: "Main Prompt", found: !!gm.mp }];
         } else {
-          found = window.RinggExtract.sectionEditors().map(function (m) {
+          found = window.PPExtract.sectionEditors().map(function (m) {
             return { title: m.title, found: !!m.el };
           });
         }
@@ -3724,7 +4092,7 @@
 
   // ---- test hook (harmless; used only by the offline stress harness) ------
   try {
-    window.__ringgTest = {
+    window.__ppTest = {
       nameFromUI: nameFromUI, fileBase: fileBase, matchSection: matchSection,
       lineDiff: lineDiff, coarseDiff: coarseDiff, escapeRegExp: escapeRegExp,
       mdToHtml: mdToHtml, htmlToText: htmlToText, planImport: planImport,
@@ -3732,10 +4100,10 @@
       sectionHeaderAt: sectionHeaderAt,
       collectSections: collectSections, findAll: findAll, replaceAllBuckets: replaceAllBuckets,
       sanitizeHtml: sanitizeHtml, applyReplace: applyReplace,
-      findRinggSaveButton: findRinggSaveButton, saveToRingg: saveToRingg,
+      findDash5SaveButton: findDash5SaveButton, saveToDash5: saveToDash5,
       sectionsToFiles: sectionsToFiles, sectionsToTwoFiles: sectionsToTwoFiles,
-      isGorezolv: isGorezolv, gorezolvEditors: gorezolvEditors, splitMainPrompt: splitMainPrompt,
-      gorezolvFiveSections: gorezolvFiveSections, liveMainSplit: liveMainSplit, doDownload: doDownload,
+      isTwoField: isTwoField, twoFieldEditors: twoFieldEditors, splitMainPrompt: splitMainPrompt,
+      twoFieldFiveSections: twoFieldFiveSections, liveMainSplit: liveMainSplit, doDownload: doDownload,
       hydrateMentions: hydrateMentions, mdToHydratedHtml: mdToHydratedHtml,
       snapshotBuckets: snapshotBuckets, runImport: runImport, backupStamp: backupStamp,
       getLastBackup: function () { return _lastBackup; },

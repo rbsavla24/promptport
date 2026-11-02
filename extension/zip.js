@@ -3,7 +3,7 @@
  *
  * Tiny, dependency-free ZIP writer. Uses the STORE method (no compression),
  * which keeps the code small and needs no external library. Good enough for a
- * handful of small markdown files. Exposes window.RinggZip.make(files) where
+ * handful of small markdown files. Exposes window.PPZip.make(files) where
  * files = [{ name: "objective.md", content: "..." }] and returns a Blob.
  */
 (function () {
@@ -126,7 +126,7 @@
   // <a download="name"> attribute on blob: URLs minted inside a content script
   // (the file would save as "download"); a data: URL keeps the real filename.
   function toDataUrl(files) {
-    window.RinggZip.make(files); // (via the public name so test spies see it)
+    window.PPZip.make(files); // (via the public name so test spies see it)
     var bytes = make.lastBytes, bin = "", CH = 0x8000;
     for (var i = 0; i < bytes.length; i += CH) {
       bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
@@ -134,5 +134,5 @@
     return "data:application/zip;base64," + btoa(bin);
   }
 
-  window.RinggZip = { make: make, crc32: crc32, toDataUrl: toDataUrl };
+  window.PPZip = { make: make, crc32: crc32, toDataUrl: toDataUrl };
 })();

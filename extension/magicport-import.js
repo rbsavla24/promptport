@@ -19,7 +19,7 @@
  * Safety:
  *   - Stops immediately on an auth redirect (session drop) and reports where it
  *     reached — never "saves into the void".
- *   - Flags not-portable items (e.g. Rezolv QA has no Pre-Call tools) instead of
+ *   - Flags not-portable items (e.g. Dash2 QA has no Pre-Call tools) instead of
  *     failing the whole run.
  *
  * content.js owns: the uploaded zip parse, the pre-import backup/undo, the UI
@@ -38,11 +38,11 @@
   function dom() { return (D = D || window.MagicPortDom); }
   function sleep(ms) { return dom().sleep(ms); }
 
-  var REZOLV = "rezolv", RINGG = "ringg";
+  var DASH2 = "dash2", DASH5 = "dash5";
 
   // ---- navigation ---------------------------------------------------------
-  // Rezolv left-nav tab labels.
-  var REZOLV_TABS = {
+  // Dash2 left-nav tab labels.
+  var DASH2_TABS = {
     prompt: "Prompt",
     variables: "Custom Variables",
     languageVoice: "Language and Voice",
@@ -60,40 +60,119 @@
   //
   // The old wait was `... || true`, so it returned success unconditionally and
   // never checked that the tab had actually switched. Confirm via aria-selected.
-  async function gotoTab(label) {
+  async function gotoTab(label, opts) {
     var d = dom();
-    function trigger() {
-      return [].slice.call(document.querySelectorAll("button, a, [role='tab']"))
-        .filter(function (b) { return d.visible(b) && d.norm(b.textContent) === label; })[0];
+    var want = d.norm(label).toLowerCase();
+    var budget = (opts && opts.budgetMs) || 9000;
+    function all() {
+      return [].slice.call(document.querySelectorAll("[role='tab'], button, a"))
+        .filter(function (b) { return d.visible(b); });
     }
-    var btn = trigger();
-    if (!btn) return false;
+    function trigger() {
+      var els = all(), txt = function (b) { return d.norm(b.textContent).toLowerCase(); };
+      // exact label first (prefer real tab triggers), then a label with a badge/count after it
+      return els.filter(function (b) { return b.getAttribute("role") === "tab" && txt(b) === want; })[0] ||
+             els.filter(function (b) { return txt(b) === want; })[0] ||
+             els.filter(function (b) { return b.getAttribute("role") === "tab" && txt(b).indexOf(want) === 0; })[0] || null;
+    }
+    function isDisabled(t) {
+      return !!(t.disabled || t.getAttribute("aria-disabled") === "true" || t.hasAttribute("data-disabled"));
+    }
     function selected() {
       var t = trigger();
       if (!t) return false;
+      if (t.getAttribute("data-state") === "active") return true;
       var a = t.getAttribute("aria-selected");
       // Plain links/buttons carry no aria-selected; fall back to the URL cue.
       if (a === null) return location.href.indexOf("tab=") !== -1;
       return a === "true";
     }
-    for (var i = 0; i < 3 && !selected(); i++) {
+    // A dropdown left open by the previous section (e.g. the language picker)
+    // swallows the next click on a tab -- close it first.
+    try { if (d.menuIsOpen && d.menuIsOpen()) await d.dismissMenu(); } catch (e) {}
+    if (selected()) { await sleep(300); return true; }
+    // Right after a section Save the dashboard can be busy re-rendering, with its
+    // tabs disabled for a few seconds. Keep trying (click, pointer sequence,
+    // focus + Enter) for up to ~9 s instead of giving up after ~1.4 s.
+    var deadline = Date.now() + budget, attempt = 0, sawDisabled = false;
+    while (Date.now() < deadline) {
       var t = trigger();
-      if (!t) return false;
-      if (i === 0) d.clickEl(t); else d.pressSequence(t);
-      await sleep(450);
+      if (t && !isDisabled(t)) {
+        try { t.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (e) {}
+        var how = attempt % 3;
+        if (how === 0) d.clickEl(t);
+        else if (how === 1) d.pressSequence(t);
+        else {
+          try { t.focus(); } catch (e) {}
+          try { t.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })); } catch (e) {}
+        }
+        attempt++;
+        await sleep(500);
+        if (selected()) { await sleep(500); return true; }
+      } else {
+        if (t) sawDisabled = true;
+        try { if (d.menuIsOpen && d.menuIsOpen()) await d.dismissMenu(); } catch (e) {}
+        await sleep(400);
+      }
     }
-    if (!selected()) return false;
-    await sleep(500);
-    return true;
+    // Say WHY, so a failure on a live dashboard is diagnosable from the report.
+    var why = [];
+    var t2 = trigger();
+    if (!t2) {
+      var seen = all().filter(function (b) { return b.getAttribute("role") === "tab"; }).map(function (b) { return d.norm(b.textContent); }).slice(0, 10);
+      why.push("tab not found on the page" + (seen.length ? " (tabs seen: " + seen.join(", ") + ")" : ""));
+    } else {
+      if (isDisabled(t2) || sawDisabled) why.push("the tab stayed disabled");
+      why.push("clicked " + attempt + "x, it never became the active tab");
+    }
+    var cur = currentTopTab(); if (cur) why.push("still on '" + cur + "'");
+    var dlg = [].slice.call(document.querySelectorAll("[role='dialog'],[role='alertdialog']")).filter(function (x) { return d.visible(x); })[0];
+    if (dlg) why.push("a dialog is open: \u201c" + d.norm(dlg.textContent).slice(0, 80) + "\u201d");
+    try { if (d.menuIsOpen && d.menuIsOpen()) why.push("a dropdown is still open"); } catch (e) {}
+    gotoTab.lastWhy = why.join("; ");
+    return false;
+  }
+  // The "Add" control next to an analysis key row. Live labels vary ("Add",
+  // "ADD", "+ Add", "Add key") and it may be a <button> or a [role=button];
+  // match all of them, case-insensitively.
+  function isAddCtl(b) {
+    var t = dom().norm(b.textContent || b.getAttribute("aria-label") || "").toLowerCase().replace(/^\+\s*/, "");
+    return /^add( new)?( key| variable| output( variable)?| field)?$/.test(t);
+  }
+  function addCtlsIn(row) {
+    return row ? [].slice.call(row.querySelectorAll("button, [role='button']")).filter(isAddCtl) : [];
+  }
+  // Press an Add control the way a person does and confirm it took. React/Radix
+  // buttons can ignore a bare .click(), and the button may stay disabled for a
+  // moment after the type is chosen while the form re-validates. Each escalation
+  // happens only if the previous attempt did not take, so a key is never added twice.
+  async function pressAdd(getBtn, done) {
+    var d = dom();
+    for (var a = 0; a < 4; a++) {
+      var b = getBtn();
+      for (var w = 0; w < 12 && b && (b.disabled || b.getAttribute("aria-disabled") === "true"); w++) { await sleep(250); b = getBtn(); }
+      if (!b) return done();
+      if (a === 0) d.clickEl(b);
+      else if (a === 1) d.pressSequence(b);
+      else if (a === 2) { try { b.focus(); } catch (e) {} b.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })); b.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })); }
+      else { var f = b.closest("form"); if (f) { try { if (f.requestSubmit) f.requestSubmit(); else f.submit(); } catch (e) {} } }
+      await sleep(500);
+      if (done()) return true;
+    }
+    return done();
   }
 
-  // Which top-level tab is showing right now (one of REZOLV_TABS), or "".
+  function tabFail(section, label) {
+    return fail(section, "the '" + label + "' tab could not be selected" + (gotoTab.lastWhy ? " — " + gotoTab.lastWhy : ""));
+  }
+
+  // Which top-level tab is showing right now (one of DASH2_TABS), or "".
   // A section that has nothing to do (e.g. no tools) returns before navigating,
   // so without this the next commit would re-save the PREVIOUS tab.
   function currentTopTab() {
     var d = dom();
     var labels = [];
-    for (var k in REZOLV_TABS) { if (REZOLV_TABS.hasOwnProperty(k)) labels.push(REZOLV_TABS[k]); }
+    for (var k in DASH2_TABS) { if (DASH2_TABS.hasOwnProperty(k)) labels.push(DASH2_TABS[k]); }
     var t = [].slice.call(document.querySelectorAll('button[role="tab"]'))
       .filter(function (x) {
         return d.visible(x) && x.getAttribute("aria-selected") === "true" &&
@@ -123,15 +202,15 @@
   }
 
   // ========================================================================
-  //  REZOLV destination sections
+  //  DASH2 destination sections
   // ========================================================================
 
   // ---- 2. Custom Variables (REQ-1) ---------------------------------------
-  async function rezolvVariables(vars) {
+  async function dash2Variables(vars) {
     var d = dom();
     if (d.isAuthRedirect()) return authStop("variables");
-    if (!(await gotoTab(REZOLV_TABS.variables)))
-      return fail("variables", "the '" + REZOLV_TABS.variables + "' tab could not be selected");
+    if (!(await gotoTab(DASH2_TABS.variables)))
+      return tabFail("variables", DASH2_TABS.variables);
 
     function nameInput() {
       return [].slice.call(document.querySelectorAll("input"))
@@ -177,8 +256,8 @@
         if (tnow && d.norm(tnow.value) !== wantType) return;   // let the retry handle it
         var ab = addBtn(); if (ab) ab.click();
       }, function () {
-        if (readRezolvVariableNames().indexOf(v.name) === -1) return false;
-        var got = readRezolvVariableTypes()[v.name];
+        if (readDash2VariableNames().indexOf(v.name) === -1) return false;
+        var got = readDash2VariableTypes()[v.name];
         // an unreadable chip type must not fail a variable that is really there
         return !got || d.norm(got) === wantType;
       }, 3);
@@ -193,11 +272,11 @@
     // verify (REQ-1): re-read variable chips. The list can lag its backend, so
     // re-read a few times before calling a variable missing.
     await sleep(400);
-    var actual = readRezolvVariableNames();
+    var actual = readDash2VariableNames();
     var vr = window.MagicPort.verifyVariables(vars, actual);
     for (var vt = 0; vt < 5 && !vr.ok; vt++) {
       await sleep(500);
-      actual = readRezolvVariableNames();
+      actual = readDash2VariableNames();
       vr = window.MagicPort.verifyVariables(vars, actual);
     }
 
@@ -207,7 +286,7 @@
     // copy used to claim the import "overwrites" the destination; it does not.)
     // verify TYPES too (the chips carry them). Names alone were never enough:
     // a Date that silently landed as String passed every check before this.
-    var typesByName = readRezolvVariableTypes();
+    var typesByName = readDash2VariableTypes();
     var wrongTypes = [];
     vars.forEach(function (v) {
       var want = String(v.type || "").trim().toLowerCase() === "date" ? "Date" : "String";
@@ -229,7 +308,7 @@
       failedItems: failedItems };
   }
 
-  function readRezolvVariableNames() {
+  function readDash2VariableNames() {
     // chips render as "Pretty Name [Type]" but store snake_case; the Remove
     // button's aria-label carries the real name: "Remove <name>".
     return [].slice.call(document.querySelectorAll("button[aria-label^='Remove ']"))
@@ -241,8 +320,8 @@
   // brackets; the name comes from the Remove button's aria-label, since the
   // visible label is prettified. A chip whose type we cannot read is reported
   // as "" rather than guessed, so an unreadable chip never masquerades as a
-  // correct one. Variables are String or Date only on Rezolv.
-  function readRezolvVariableTypes() {
+  // correct one. Variables are String or Date only on Dash2.
+  function readDash2VariableTypes() {
     var out = {};
     [].slice.call(document.querySelectorAll("button[aria-label^='Remove ']")).forEach(function (b) {
       var name = (b.getAttribute("aria-label") || "").replace(/^Remove\s+/, "").trim();
@@ -259,11 +338,11 @@
   }
 
   // ---- 4. Custom Analysis: prompt + keys (REQ-2) -------------------------
-  async function rezolvAnalysis(analysis, ctx) {
+  async function dash2Analysis(analysis, ctx) {
     var d = dom();
     if (d.isAuthRedirect()) return authStop("analysis");
-    if (!(await gotoTab(REZOLV_TABS.analysis)))
-      return fail("analysis", "the '" + REZOLV_TABS.analysis + "' tab could not be selected");
+    if (!(await gotoTab(DASH2_TABS.analysis)))
+      return tabFail("analysis", DASH2_TABS.analysis);
     ctx = ctx || {};
     var promptWhy = "";
 
@@ -303,7 +382,7 @@
       var row = inp;
       for (var k = 0; k < 6 && row; k++) {
         row = row.parentElement;
-        if (row && [].slice.call(row.querySelectorAll("button")).some(function (b) { return d.norm(b.textContent) === "Add"; })) break;
+        if (row && addCtlsIn(row).length) break;
       }
       return row;
     }
@@ -322,8 +401,15 @@
     function keyTypeValue() {
       var t = keyTypeTrigger();
       if (!t) return "";
-      var v = d.norm(t.textContent);
-      return v === "Type" ? "" : v;      // "Type" is the empty-state label
+      // LIVE DOM (2026-11-02): the chosen type lives in a read-only <input> inside
+      // the trigger; the trigger's text is only the floating label "Type". Reading
+      // textContent therefore always said "nothing chosen", so the type was picked
+      // on screen but the code kept re-picking it and never pressed Add.
+      var inp = t.querySelector("input");
+      var v = inp ? d.norm(inp.value) : "";
+      if (v) return v;
+      v = d.norm(t.textContent).replace(/^Type\s*/, "");
+      return v === "Type" ? "" : v;      // "Type" alone is the empty-state label
     }
     // Choose the type explicitly. Never assume a default.
     async function setKeyType(want) {
@@ -340,7 +426,7 @@
       }
       return d.norm(keyTypeValue()) === d.norm(want);
     }
-    // Rezolv's list lags its own backend, so a freshly added key can be absent
+    // Dash2's list lags its own backend, so a freshly added key can be absent
     // from the rendered list for a moment. The form says "Key already added"
     // when the name exists server-side -- treat that as present, or the retry
     // loop re-adds the same key and the section reports it "missing".
@@ -355,8 +441,8 @@
     }
     function addBtn() {
       var inp = keyNameInput(); if (!inp) return null;
-      var row = inp; for (var k = 0; k < 6 && row; k++) { row = row.parentElement; if (row && [].slice.call(row.querySelectorAll("button")).some(function (b) { return d.norm(b.textContent) === "Add"; })) break; }
-      return row ? [].slice.call(row.querySelectorAll("button")).filter(function (b) { return d.norm(b.textContent) === "Add"; })[0] : null;
+      var row = inp; for (var k = 0; k < 6 && row; k++) { row = row.parentElement; if (row && addCtlsIn(row).length) break; }
+      return addCtlsIn(row)[0] || null;
     }
 
     var keys = analysis.keys || [];
@@ -379,11 +465,16 @@
           var want = k.required !== false;
           if (isOn !== want) d.pressSequence(sw);
         }
-        var ab = addBtn(); if (ab) ab.click();
+        var nBefore = Object.keys(readDash2AnalysisKeyTypes([k.name])).length;
+        await pressAdd(addBtn, function () {
+          // it took when the key shows in the list, the form says it exists, or the name box cleared
+          var inp2 = keyNameInput();
+          return Object.keys(readDash2AnalysisKeyTypes([k.name])).length > nBefore || keyAlreadyFlagged() || !!(inp2 && !inp2.value);
+        });
       }, function () {
         // verify the key now exists with the correct type (REQ-2). The rendered
         // list can lag the backend, so an "already added" notice counts too.
-        var byName = readRezolvAnalysisKeyTypes();
+        var byName = readDash2AnalysisKeyTypes([k.name]);
         if (byName[k.name] && dom().norm(byName[k.name]) === dom().norm(k.type)) return true;
         return keyAlreadyFlagged();
       }, 3);
@@ -395,16 +486,17 @@
     d.clickSectionSave("Test Analysis");
     await d.waitForToast(/custom analysis saved|saved|updated/i, 3500);
 
-    // verify (REQ-2): re-read each key's type. Rezolv renders this list behind
+    // verify (REQ-2): re-read each key's type. Dash2 renders this list behind
     // its own backend, so a single read right after saving can still show the
     // pre-save state and report every key "missing". Re-read until the list
     // agrees or we run out of patience.
     await sleep(400);
-    var actualByName = readRezolvAnalysisKeyTypes();
+    var keyNames = keys.map(function (x) { return x.name; });
+    var actualByName = readDash2AnalysisKeyTypes(keyNames);
     var kr = window.MagicPort.verifyKeyTypes(keys, actualByName);
     for (var vtry = 0; vtry < 5 && !kr.ok; vtry++) {
       await sleep(500);
-      actualByName = readRezolvAnalysisKeyTypes();
+      actualByName = readDash2AnalysisKeyTypes(keyNames);
       kr = window.MagicPort.verifyKeyTypes(keys, actualByName);
     }
     var failedAll = failedKeys.slice();
@@ -414,17 +506,39 @@
 
   // name -> type from the rendered "name [Type] Required" rows. innerText is the
   // reliable source (name/type live in separate spans), so parse from it.
-  function readRezolvAnalysisKeyTypes() {
+  function readDash2AnalysisKeyTypes(names) {
     var main = document.querySelector("main") || document.body;
     var txt = main.innerText || "";
+    var TY = "(String\\[\\]|String|Number|Boolean)";
     var out = {};
-    var re = /([a-z][a-z0-9_]{1,60})\s*\[(String|Number|Boolean|String\[\])\]/g, m;
+    // Generic pass (live-verified 2026-10-31): lower-case snake_case names.
+    var re = /([a-z][a-z0-9_]{1,60})\s*\[(String\[\]|String|Number|Boolean)\]/g, m;
     while ((m = re.exec(txt))) { if (!out[m[1]]) out[m[1]] = m[2]; }
+    // Exact pass for every key we are looking for, so names with capitals,
+    // digits first, dots or dashes are read too -- and a name is never confused
+    // with the tail of a longer one ("Q1_score" vs "score").
+    (names || []).forEach(function (n) {
+      var esc = String(n).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      var hit = txt.match(new RegExp("(?:^|[^A-Za-z0-9_.\\-])" + esc + "\\s*\\[" + TY + "\\]")) ||
+                // rows that show the type without brackets ("name\nString\nRequired")
+                txt.match(new RegExp("(?:^|\\n)\\s*" + esc + "\\s*\\n\\s*[\\[(]?" + TY + "[\\])]?\\s*(?:\\n|$|Required|Optional)"));
+      if (!hit) {
+        // Fallback: an element whose own text starts with exactly this name.
+        var rx = new RegExp("^" + esc + "\\s*(?:\\[" + TY + "\\]|\\(" + TY + "\\)|" + TY + "(?=\\s|Required|Optional|Remove|Delete|$))");
+        var els = main.querySelectorAll("*");
+        for (var i = 0; i < els.length && !hit; i++) {
+          var t = (els[i].textContent || "").replace(/\s+/g, " ").trim();
+          if (t.indexOf(n) === 0) hit = t.match(rx);
+        }
+      }
+      if (hit) out[n] = hit[1] || hit[2] || hit[3];
+      else delete out[n];          // never trust a partial-name match for a key we asked about
+    });
     return out;
   }
 
   // ---- 6. Event Subscription ---------------------------------------------
-  async function rezolvEvents(events) {
+  async function dash2Events(events) {
     var d = dom();
     if (d.isAuthRedirect()) return authStop("events");
     events = events || [];
@@ -433,9 +547,9 @@
     if (!events.length) {
       return { section: "events", ok: true, created: 0, expected: 0, alreadyPresent: 0, failedItems: [] };
     }
-    if (!(await gotoTab(REZOLV_TABS.events)))
-      return fail("events", "the '" + REZOLV_TABS.events + "' tab could not be selected");
-    var REZOLV_EVENT_ORDER = ["Transcript ready", "Recording ready", "Analysis completed"];
+    if (!(await gotoTab(DASH2_TABS.events)))
+      return tabFail("events", DASH2_TABS.events);
+    var DASH2_EVENT_ORDER = ["Transcript ready", "Recording ready", "Analysis completed"];
 
     // Each existing subscription exposes its URL in the delete button's
     // aria-label ("Delete subscription <url>"), so we can identify rows by URL
@@ -466,14 +580,14 @@
     function eventsFor(url) {
       var row = rowFor(url); if (!row) return [];
       var t = d.norm(row.innerText);
-      return REZOLV_EVENT_ORDER.filter(function (e) { return t.indexOf(e) !== -1; });
+      return DASH2_EVENT_ORDER.filter(function (e) { return t.indexOf(e) !== -1; });
     }
 
     var failedHooks = [], createdCount = 0, alreadyPresent = 0;
     for (var i = 0; i < events.length; i++) {
       if (d.isAuthRedirect()) return authStop("events");
       var w = events[i];
-      var want = (w.events && w.events.length) ? w.events : REZOLV_EVENT_ORDER.slice();
+      var want = (w.events && w.events.length) ? w.events : DASH2_EVENT_ORDER.slice();
 
       // Idempotent: if this URL is already subscribed with the right events,
       // leave it alone. Previously every retry created another copy.
@@ -554,14 +668,14 @@
   }
 
   // ---- scaffolded sections (finalized during live pass) -------------------
-  async function rezolvPrompt(mapped, ctx) {
+  async function dash2Prompt(mapped, ctx) {
     var d = dom();
     if (d.isAuthRedirect()) return authStop("prompt");
     // MUST be on the Prompt tab before writing (its editors live there), and the
     // section MUST be saved before the orchestrator navigates to the next tab,
     // or an SPA tab-switch can discard the unsaved editor content.
-    if (!(await gotoTab(REZOLV_TABS.prompt)))
-      return fail("prompt", "the '" + REZOLV_TABS.prompt + "' tab could not be selected");
+    if (!(await gotoTab(DASH2_TABS.prompt)))
+      return tabFail("prompt", DASH2_TABS.prompt);
     if (ctx && typeof ctx.importPrompt === "function") {
       var r = await ctx.importPrompt(mapped);
       if (d.isAuthRedirect()) return authStop("prompt");
@@ -571,11 +685,11 @@
     }
     return { section: "prompt", ok: false, reason: "prompt writer hook not provided (TODO@LIVE)" };
   }
-  async function rezolvLanguageVoice(lv) {
+  async function dash2LanguageVoice(lv) {
     var d = dom();
     if (d.isAuthRedirect()) return authStop("languageVoice");
-    if (!(await gotoTab(REZOLV_TABS.languageVoice)))
-      return fail("languageVoice", "the '" + REZOLV_TABS.languageVoice + "' tab could not be selected");
+    if (!(await gotoTab(DASH2_TABS.languageVoice)))
+      return tabFail("languageVoice", DASH2_TABS.languageVoice);
     lv = lv || {};
     var failed = [];
 
@@ -597,7 +711,7 @@
 
     async function setLang(labelText, value) {
       if (!value) return true;
-      // Rezolv shows plain names ("English"); Ringg may carry a region ("English (IN)").
+      // Dash2 shows plain names ("English"); Dash5 may carry a region ("English (IN)").
       var tries = [value, value.replace(/\s*\([^)]*\)\s*/g, "").trim()];
       for (var a = 1; a <= 3; a++) {
         if (d.isAuthRedirect()) return false;
@@ -630,22 +744,22 @@
   }
   var PHASES = ["pre_call", "on_call", "post_call"];
   var PHASE_TAB = { pre_call: "Pre Call", on_call: "On call", post_call: "Post Call" };
-  async function rezolvTools(tools, ctx) {
+  async function dash2Tools(tools, ctx) {
     var d = dom(); ctx = ctx || {};
     if (d.isAuthRedirect()) return authStop("tools");
     tools = tools || {};
     if (!PHASES.some(function (p) { return (tools[p] || []).length; })) return { section: "tools", ok: true, created: 0 };
-    if (!(await gotoTab(REZOLV_TABS.tools)))
-      return fail("tools", "the '" + REZOLV_TABS.tools + "' tab could not be selected");
+    if (!(await gotoTab(DASH2_TABS.tools)))
+      return tabFail("tools", DASH2_TABS.tools);
     var failed = [], created = 0;
 
     // True when the SELECTED phase cannot take API tools. Verified live
-    // 2026-10-31 on Rezolv QA: Pre Call and Post Call both render "Coming
+    // 2026-10-31 on Dash2 QA: Pre Call and Post Call both render "Coming
     // soon." and carry no "+ API" control; only On call accepts tools.
     // Scoped to the phase's own panel: reading the whole <main> meant any
     // "Coming soon." anywhere on the page would declare EVERY phase dead.
     // Falls back to <main> only if the panel cannot be resolved.
-    // Name a tool for the report. The raw Ringg object carries tool_name;
+    // Name a tool for the report. The raw Dash5 object carries tool_name;
     // only extractToolParts produces .name, so reading t.name gave every
     // skipped tool the label "tool" -- three unmigratable pre-call tools all
     // reported as "Pre Call: tool".
@@ -683,7 +797,7 @@
     // ("Edit API <name>" / "Delete API <name>") — never as visible text.
     // The old text scan therefore ALWAYS failed, so withRetry re-ran addTool and
     // created DUPLICATES while still reporting the tool as failed.
-    // Verified live on Rezolv QA 2026-10-31.
+    // Verified live on Dash2 QA 2026-10-31.
     function toolExists(name) {
       if (!name) return false;
       var want = d.norm(name);
@@ -726,14 +840,14 @@
         || labeledInput("Method") || labeledInput("HTTP Method");
     }
 
-    // ------- line-item rows (VERIFIED live on Rezolv QA, 2026-10-31) ----------
+    // ------- line-item rows (VERIFIED live on Dash2 QA, 2026-10-31) ----------
     // Each sub-tab (Headers / Query / Path / Body) uses the SAME pattern: an
     // "Add Row" control (a div[role=button]) opens a small menu with three row
     // types — "Static Row", "Variable Row", "JQ Row" (there is NO "Dynamic Row").
     //   Static Row   : Key input + Value input (placeholder "Type value").
     //   Variable Row : Key input + a "Search variable..." dropdown that lists the
     //                  bot's variables as "custom_args.<name>" (the SAME shape the
-    //                  engine captured on Ringg) — pick the matching option.
+    //                  engine captured on Dash5) — pick the matching option.
     //   JQ Row       : Key input + Value input (the jq expression).
     // The row lives inside the active sub-tab's role=tabpanel, which does NOT
     // contain the Name / Method / api_url header inputs, so scoping finders to
@@ -773,8 +887,8 @@
       d.openDropdown(combo);
       await sleep(450);
       var name = item.variable || item.value;
-      // Rezolv lists custom variables as "custom_args.<name>". call_data /
-      // platform_analysis / client_analysis / tool_output are Ringg-only sources
+      // Dash2 lists custom variables as "custom_args.<name>". call_data /
+      // platform_analysis / client_analysis / tool_output are Dash5-only sources
       // with no custom-variable equivalent — try the literal, else give up (flag).
       var wanted = [];
       var src = item.source || "custom_args";
@@ -782,8 +896,9 @@
       else { wanted.push(src + "." + name); wanted.push("custom_args." + name); }
       if (item.value) wanted.push(item.value);
       // If an inline search box appeared, type to filter the (possibly long) list.
+      // LIVE 2026-11-02: the picker's filter box reads "Enter the value to filter".
       var filt = [].slice.call(document.querySelectorAll("input"))
-        .filter(function (i) { return d.visible(i) && /search variable/i.test(i.placeholder || ""); })[0];
+        .filter(function (i) { return d.visible(i) && /search variable|value to filter|filter|search/i.test(i.placeholder || ""); })[0];
       if (filt) { d.setReactInput(filt, name); await sleep(400); }
       for (var w = 0; w < wanted.length; w++) {
         if (clickOption(wanted[w])) { await sleep(300); return true; }
@@ -833,8 +948,8 @@
         var item = pairs[i];
         var typeLabel = ROW_TYPE[item.kind];
         if (!typeLabel) {
-          // "dynamic" (or any other kind) has no Rezolv row type — flag, don't guess.
-          failed.push(sectionLabel + ": " + item.key + " (" + (item.kind || "unknown") + " — no Rezolv row type)");
+          // "dynamic" (or any other kind) has no Dash2 row type — flag, don't guess.
+          failed.push(sectionLabel + ": " + item.key + " (" + (item.kind || "unknown") + " — no matching row type on this dashboard)");
           continue;
         }
         var beforeInputs = [].slice.call(subPanel.querySelectorAll("input")).filter(function (x) { return d.visible(x); });
@@ -878,18 +993,30 @@
           var sKey = rowInputs[0];
           var sVal = rowInputs[1];
           if (sKey) d.setReactInput(sKey, item.key);
-          if (sVal) d.setReactInput(sVal, item.value);   // static literal, or the jq expression
+          // static literal as-is; a jq expression adapted to this dashboard's JQ input
+          var val = item.kind === "jq" ? window.MagicPort.jqForDash2(item.value).value : item.value;
+          if (sVal) d.setReactInput(sVal, val);
         }
         await sleep(150);
       }
     }
 
     // Close a left-over "+ API" modal (e.g. after a failed attempt) before retrying.
+    // LIVE 2026-11-02: the drawer's "Cancel" does NOT close it when pressed from
+    // script (neither click nor pointer sequence); its header "Close" (aria-label)
+    // does. Try Close first, then Cancel, and confirm the drawer is gone.
+    function apiDrawerOpen() {
+      return [].slice.call(document.querySelectorAll("button,[role='button']"))
+        .some(function (b) { return d.visible(b) && d.norm(b.textContent) === "Add to Assistance"; });
+    }
     function closeOpenApiModal() {
-      if (!/Add to Assistance/.test((document.body.innerText || ""))) return;
-      var x = [].slice.call(document.querySelectorAll("button,[role='button']"))
-        .filter(function (b) { return d.visible(b) && (d.norm(b.textContent) === "Cancel"); })[0];
-      if (x) d.pressSequence(x);
+      if (!apiDrawerOpen()) return true;
+      var x = [].slice.call(document.querySelectorAll("button[aria-label='Close'],button[aria-label='close']")).filter(function (b) { return d.visible(b); })[0];
+      if (x) { d.clickEl(x); if (!apiDrawerOpen()) return true; d.pressSequence(x); if (!apiDrawerOpen()) return true; }
+      var c = [].slice.call(document.querySelectorAll("button,[role='button']"))
+        .filter(function (b) { return d.visible(b) && d.norm(b.textContent) === "Cancel"; })[0];
+      if (c) d.pressSequence(c);
+      return !apiDrawerOpen();
     }
 
     var lastToolError = "";
@@ -957,6 +1084,22 @@
       // Same defect class as the webhook duplicated on the 4th hook.
       await d.waitFor(function () { return toolExists(parts.name); }, 6000, 250);
       await sleep(300);
+      if (!toolExists(parts.name) && apiDrawerOpen()) {
+        // The dashboard refused the tool. Record what it complained about so the
+        // report says WHY (a field marked invalid, an error line, a toast), then
+        // close the drawer so the retry starts clean.
+        var why = [];
+        [].slice.call(document.querySelectorAll("[aria-invalid='true']")).forEach(function (f) {
+          if (d.visible(f)) why.push((f.getAttribute("aria-label") || "a field") + " marked invalid");
+        });
+        [].slice.call(document.querySelectorAll("p,span,div,li")).forEach(function (e) {
+          if (e.children.length || !d.visible(e)) return;
+          var t = d.norm(e.textContent);
+          if (t.length > 3 && t.length < 160 && /(required|invalid|error|failed|must|not allowed|already exists|unable)/i.test(t) && why.indexOf(t) === -1) why.push(t);
+        });
+        lastToolError = "the dashboard did not accept the tool" + (why.length ? ": " + why.slice(0, 3).join("; ") : "");
+        closeOpenApiModal(); await sleep(300);
+      }
     }
 
     for (var pi = 0; pi < PHASES.length; pi++) {
@@ -1009,18 +1152,18 @@
     var mapped = window.MagicPort.mapForDestination(config, dest);
     var results = [], notes = (mapped.notes || []).slice();
 
-    if (dest !== REZOLV) {
-      return { ok: false, reason: "Ringg-destination import not implemented yet (this build targets Rezolv destination).", results: results };
+    if (dest !== DASH2) {
+      return { ok: false, reason: "Magic Port imports into the 2-field dashboard; importing into a 5-field dashboard is not supported yet.", results: results };
     }
 
     // order: variables -> tools -> prompt -> language/voice -> analysis -> events
     var steps = [
-      function () { return rezolvVariables(mapped.data.variables); },
-      function () { return rezolvTools(mapped.data.tools, ctx); },
-      function () { return rezolvPrompt(mapped, ctx); },
-      function () { return rezolvLanguageVoice(mapped.data.languageVoice); },
-      function () { return rezolvAnalysis(mapped.data.analysis, ctx); },
-      function () { return rezolvEvents(mapped.data.events); }
+      function () { return dash2Variables(mapped.data.variables); },
+      function () { return dash2Tools(mapped.data.tools, ctx); },
+      function () { return dash2Prompt(mapped, ctx); },
+      function () { return dash2LanguageVoice(mapped.data.languageVoice); },
+      function () { return dash2Analysis(mapped.data.analysis, ctx); },
+      function () { return dash2Events(mapped.data.events); }
     ];
     // Raj: commit section-by-section. Each section function already inserts its
     // data and clicks its OWN section Save; after each one returns we ALSO click
@@ -1055,6 +1198,25 @@
       if (dom().isAuthRedirect()) { results.push(authStop("commit")); stopped = true; break; }
     }
 
+    // Second chance for sections that never got going because their tab could not
+    // be opened (e.g. the dashboard was still busy after the previous save). Run
+    // each once more now that the page has settled; commit if that tab has a Save.
+    if (!stopped) {
+      for (var j = 0; j < steps.length && j < results.length; j++) {
+        var prev = results[j];
+        if (!prev || prev.ok || !/tab could not be selected/.test(prev.reason || "")) continue;
+        await sleep(1500);
+        var again;
+        try { again = await steps[j](); } catch (e) { again = { section: prev.section, ok: false, reason: String(e) }; }
+        if (again) { again.retried = true; results[j] = again; }
+        if (again && again.stop) { stopped = true; break; }
+        if (again && again.ok && dom().findGlobalSave()) {
+          if (dom().clickGlobalSave()) globalCommits++;
+          await dom().waitForToast(/saved|updated|success/i, 3500);
+        }
+      }
+    }
+
     // Report the commit cadence. ok means every tab that HAD an overall Save
     // was committed — not that all six tabs had one.
     if (!stopped) {
@@ -1070,10 +1232,10 @@
   window.MagicPortImport = {
     run: run,
     _sections: {
-      variables: rezolvVariables, analysis: rezolvAnalysis, events: rezolvEvents,
-      prompt: rezolvPrompt, languageVoice: rezolvLanguageVoice, tools: rezolvTools
+      variables: dash2Variables, analysis: dash2Analysis, events: dash2Events,
+      prompt: dash2Prompt, languageVoice: dash2LanguageVoice, tools: dash2Tools
     },
-    _read: { variableNames: readRezolvVariableNames, variableTypes: readRezolvVariableTypes, analysisKeyTypes: readRezolvAnalysisKeyTypes },
+    _read: { variableNames: readDash2VariableNames, variableTypes: readDash2VariableTypes, analysisKeyTypes: readDash2AnalysisKeyTypes },
     gotoTab: gotoTab
   };
 })();

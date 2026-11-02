@@ -7,7 +7,7 @@
  *   2) DOM  — find the field on the page by its visible label.
  * Whichever produces non-empty text wins (API preferred).
  *
- * Exposes window.RinggExtract:
+ * Exposes window.PPExtract:
  *   .SECTIONS                      -> section definitions
  *   .fromApi(assistantObj)         -> { key: {text, source} }
  *   .fromDom()                     -> { key: {text, source} }
@@ -86,10 +86,10 @@
       if (typeof turndownPluginGfm !== "undefined") _td.use(turndownPluginGfm.gfm);
     } catch (e) {}
     // Strikethrough as GFM "~~x~~" (the plugin default "~x~" isn't read back).
-    _td.addRule("ringgStrike", { filter: ["del", "s", "strike"], replacement: function (c) { return c.trim() ? "~~" + c + "~~" : c; } });
+    _td.addRule("ppStrike", { filter: ["del", "s", "strike"], replacement: function (c) { return c.trim() ? "~~" + c + "~~" : c; } });
     // Table cells: a literal "|" (e.g. the @||tool|| variable form) would split
     // the cell on re-import, so escape it as "\|" (GFM's own cell escape).
-    _td.addRule("ringgTableCell", {
+    _td.addRule("ppTableCell", {
       filter: ["th", "td"],
       replacement: function (content, node) {
         var idx = Array.prototype.indexOf.call(node.parentNode.childNodes, node);
@@ -102,7 +102,7 @@
     // Mention chips -> their variable token, e.g. "@{{callee_name}}".
     // The visible text of a chip is the friendly label ("Callee Name"), so the
     // token must come from data-id / data-label, NOT the rendered text.
-    _td.addRule("ringgMention", {
+    _td.addRule("ppMention", {
       filter: function (node) {
         return node.nodeName === "SPAN" &&
           (node.getAttribute("data-type") === "mention" ||
@@ -116,9 +116,9 @@
         // NOT reconstruct via mentionToken() (that force-wraps in {{ }} and would
         // corrupt the (( )) and || || forms). Fall back to data-id only if empty.
         var t = (node.textContent || "").trim();
-        // Rezolv's chips show the bare token ("{{customer_name}}") and keep the
+        // Dash2's chips show the bare token ("{{customer_name}}") and keep the
         // "@" in data-mention-suggestion-char — put it back so the markdown
-        // token is the same "@{{…}}" form Ringg exports (and import re-hydrates).
+        // token is the same "@{{…}}" form Dash5 exports (and import re-hydrates).
         if (t && t.charAt(0) !== "@" && /^(\{\{[\s\S]*\}\}|\(\([\s\S]*\)\)|\|\|[\s\S]*\|\|)$/.test(t)) {
           t = (node.getAttribute("data-mention-suggestion-char") || "@") + t;
         }
@@ -544,7 +544,7 @@
     return false;
   }
 
-  // The disclosure control for a bucket header. Ringg renders each bucket as a
+  // The disclosure control for a bucket header. Dash5 renders each bucket as a
   // header row (a <div>) containing the label (an <h2>) plus a small chevron
   // <button> sibling; the header and the section themselves are INERT — only
   // that button toggles the bucket. It carries no aria-expanded/data-state, but
@@ -586,9 +586,8 @@
   // Clicks open any of the 5 content buckets that are collapsed. Returns how
   // many it clicked so the caller can wait for content to render before copying.
   function expandCollapsed() {
-    // Ringg-only: never click toggles on the Rezolv Voicebot Panel (prod or QA/dev).
-    if (/(^|\.)panels\.gorezolv\.com$/i.test(location.hostname || "") ||
-        /devrezolv\.com$/i.test(location.hostname || "")) return 0;
+    // Dash5-only: never click toggles on the 2-field dashboard (prod or QA/dev).
+    if (window.PPHost && window.PPHost.layout() === "dash2") return 0;
     var headers = SECTIONS.map(headerFor);
     var clicked = 0;
 
@@ -621,7 +620,7 @@
       }
 
       if (collapsed) {
-        // Click the actual chevron button when we found one (Ringg's header/label
+        // Click the actual chevron button when we found one (Dash5's header/label
         // are inert). Fall back to a state element or the header, but never click
         // a plain element inside a link — it could navigate away.
         var target = toggle || st || h;
@@ -715,7 +714,7 @@
     });
   }
 
-  window.RinggExtract = {
+  window.PPExtract = {
     SECTIONS: SECTIONS,
     fromApi: fromApi,
     fromDom: fromDom,

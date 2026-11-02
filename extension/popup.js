@@ -13,11 +13,9 @@
     });
   }
 
-  function onRinggPage(tab) {
-    return tab && tab.url && (
-      /:\/\/[^/]*ringg\.ai\//.test(tab.url) ||
-      /:\/\/panels\.gorezolv\.com\/voicebot\//.test(tab.url)
-    );
+  // A supported dashboard page? (addresses come from manifest.json via host.js)
+  function onSupportedPage(tab) {
+    return !!(tab && tab.url && window.PPHost && window.PPHost.layoutOfUrl(tab.url));
   }
 
   function send(tabId, msg, cb) {
@@ -52,7 +50,7 @@
 
   function refresh() {
     activeTab(function (tab) {
-      if (!onRinggPage(tab)) {
+      if (!onSupportedPage(tab)) {
         statusEl.textContent = "Open a supported prompt page to use this.";
         dlBtn.disabled = true; panelBtn.disabled = true;
         return;
@@ -70,7 +68,7 @@
 
   dlBtn.addEventListener("click", function () {
     activeTab(function (tab) {
-      if (!onRinggPage(tab)) return;
+      if (!onSupportedPage(tab)) return;
       // Copying must happen under a real page click, so open the on-page panel
       // and let the user press Download there (guarantees a genuine copy).
       send(tab.id, { type: "open-panel" }, function () { window.close(); });
@@ -79,7 +77,7 @@
 
   panelBtn.addEventListener("click", function () {
     activeTab(function (tab) {
-      if (!onRinggPage(tab)) return;
+      if (!onSupportedPage(tab)) return;
       send(tab.id, { type: "open-panel" }, function () { window.close(); });
     });
   });

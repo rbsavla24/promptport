@@ -2,7 +2,7 @@
  * magicport-dom.js  (ISOLATED world)  — PromptPort v4.0
  *
  * Low-level DOM-driving primitives for Magic Port import. Every technique here
- * was validated LIVE on Rezolv QA from in-page JS (see LIVE-CROSS-SITE-TEST):
+ * was validated LIVE on Dash2 QA from in-page JS (see LIVE-CROSS-SITE-TEST):
  *
  *   openDropdown(trigger)      - full pointer/mouse event sequence (a bare
  *                                .click() does NOT open React/Radix dropdowns).
@@ -17,7 +17,7 @@
  *                                with a section companion (e.g. "Test Analysis");
  *                                the GLOBAL save sits with "Back".
  *   clickButtonByText / click  - normal buttons DO respond to .click().
- *   isAuthRedirect()           - detect the Rezolv login bounce (never "save
+ *   isAuthRedirect()           - detect the Dash2 login bounce (never "save
  *                                into the void" after a session drop).
  *
  * All helpers are defensive and return booleans / found elements so the
@@ -98,7 +98,7 @@
   }
 
   // Select an option in a SINGLE-select, non-modal dropdown (the dropdown must
-  // already be open). Option styles differ across Rezolv dropdowns:
+  // already be open). Option styles differ across Dash2 dropdowns:
   //   - some select on a full press sequence (e.g. the key Type dropdown),
   //   - some are role="menuitem" buttons that select on a bare .click()
   //     (e.g. the Language pickers) and ignore a press on the inner <span>.
@@ -145,7 +145,7 @@
   // selectMenuByKeyboard read document.activeElement and almost never matched —
   // in the live run it ticked exactly ONE event and its stray Enter presses
   // submitted the dialog repeatedly, producing duplicate subscriptions.
-  // Verified live on Rezolv QA 2026-10-31.
+  // Verified live on Dash2 QA 2026-10-31.
   async function selectMenuByClick(combo, wantedTexts) {
     var selected = [];
     if (!combo) return { ok: false, selected: selected };
@@ -231,7 +231,7 @@
       .filter(function (b) { return visible(b) && norm(b.textContent) === want; });
   }
   // Drive buttons with the full pointer sequence, not a bare .click().
-  // React/Radix controls in the Rezolv panel (tab triggers, "Add to Assistance",
+  // React/Radix controls in the Dash2 panel (tab triggers, "Add to Assistance",
   // "Create Subscription", "Create") respond to pointerdown/mouseup and IGNORE a
   // synthetic click — live 2026-10-31 this silently produced "0 created" while
   // every step appeared to run. pressSequence still ends with a click event, so
@@ -267,7 +267,7 @@
   function clickSectionSave(companion) { return clickEl(findSectionSave(companion)); }
 
   // The GLOBAL page Save (bottom-right): the visible "Save" whose sibling-button
-  // group contains "Back". Clicked once at the very end of a Rezolv import to
+  // group contains "Back". Clicked once at the very end of a Dash2 import to
   // commit the whole agent.
   function findGlobalSave() {
     var saves = buttonsByText("Save");

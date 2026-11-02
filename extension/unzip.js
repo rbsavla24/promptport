@@ -6,7 +6,7 @@
  * extracts each entry — STORE (method 0) directly, DEFLATE (method 8) via the
  * browser's native DecompressionStream. Returns UTF-8 text per entry.
  *
- * window.RinggUnzip.read(arrayBuffer) -> Promise<[{ name, text }]>
+ * window.PPUnzip.read(arrayBuffer) -> Promise<[{ name, text }]>
  */
 (function () {
   "use strict";
@@ -105,5 +105,5 @@
     return out;
   }
 
-  window.RinggUnzip = { read: read };
+  window.PPUnzip = { read: read };
 })();

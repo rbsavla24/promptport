@@ -1,9 +1,9 @@
 /*
  * interceptor.js  (runs in the PAGE / MAIN world, at document_start)
  *
- * Ringg's dashboard is a single-page app: the assistant's configuration
+ * Dash5's dashboard is a single-page app: the assistant's configuration
  * (First Message, Objective, Response Guideline, Conversation Script, FAQs)
- * is loaded from Ringg's own API as JSON. This script patches fetch() and
+ * is loaded from Dash5's own API as JSON. This script patches fetch() and
  * XMLHttpRequest so we can capture that JSON as it flows by, then hands the
  * relevant payload to our extension (the ISOLATED-world content script) via
  * window.postMessage.
@@ -15,7 +15,7 @@
 (function () {
   "use strict";
 
-  var NS = "RINGG_MD_EXPORTER";
+  var NS = "PROMPTPORT_BRIDGE";
   var captures = [];        // recent JSON payloads seen, most recent last
   var assistantReq = null;  // { url, method } of a GET that returned the assistant
   var lastAssistant = null; // newest assistant payload, kept even after captures roll over
@@ -103,8 +103,8 @@
     var open = OrigXHR.prototype.open;
     var send = OrigXHR.prototype.send;
     OrigXHR.prototype.open = function (method, url) {
-      this.__ringg_url = url;
-      this.__ringg_method = method;
+      this.__pp_url = url;
+      this.__pp_method = method;
       return open.apply(this, arguments);
     };
     OrigXHR.prototype.send = function () {
@@ -114,7 +114,7 @@
           var t = (xhr.responseType === "" || xhr.responseType === "text")
                     ? xhr.responseText
                     : (xhr.responseType === "json" ? JSON.stringify(xhr.response) : null);
-          if (t) record(xhr.__ringg_url || "", xhr.__ringg_method, t);
+          if (t) record(xhr.__pp_url || "", xhr.__pp_method, t);
         } catch (e) {}
       });
       return send.apply(this, arguments);

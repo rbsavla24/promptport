@@ -2,19 +2,19 @@
  * magicport.js  (ISOLATED world)  — PromptPort v4.0
  *
  * Magic Port: migrate a FULL voice bot (prompt + configurations) between
- * Ringg and Rezolv. This file is the platform-agnostic ENGINE:
+ * Dash5 and Dash2. This file is the platform-agnostic ENGINE:
  *   - the Magic Port ZIP / config format,
  *   - extraction of all 6 data points from a source bot,
  *   - cross-platform type / event mapping (the rules verified with Raj),
  *   - validation that enforces the two correctness requirements.
  *
  * content.js is the orchestrator: it owns the captured API JSON (from
- * interceptor.js), the DOM, RinggExtract (prompt buckets) and RinggZip, and
+ * interceptor.js), the DOM, PPExtract (prompt buckets) and PPZip, and
  * calls into window.MagicPort here.
  *
  * The 6 data points (per the agreed spec):
  *   1. Prompt            — carried as the existing .md files (5 or 2 buckets)
- *   2. Custom Variables  — name (+ type on Rezolv)
+ *   2. Custom Variables  — name (+ type on Dash2)
  *   3. Language & Voice  — primary + secondary language
  *   4. Custom Analysis   — prompt + required keys {name, type, required/default}
  *   5. Tools             — per-phase API tools (cURL)
@@ -23,7 +23,7 @@
  * CORRECTNESS REQUIREMENTS (see MAGICPORT-BUILD-REQUIREMENTS):
  *   REQ-1  Copy ALL custom variables — read the complete list from the source
  *          API JSON (never a scrape of visible rows); verify the count.
- *   REQ-2  Map Integer correctly — Ringg Integer/Number/Float -> Rezolv Number
+ *   REQ-2  Map Integer correctly — Dash5 Integer/Number/Float -> Dash2 Number
  *          (NOT String); verify each key's type after import.
  *
  * NOTE on field names: the source API JSON field names are matched FLEXIBLY
@@ -39,26 +39,32 @@
   var CONFIG_NAME = "magicport.json";
 
   // ------------------------------------------------------------------ platforms
-  var RINGG = "ringg", REZOLV = "rezolv";
+  var DASH5 = "dash5", DASH2 = "dash2";
 
+  // The dashboard layout of this page (addresses come from manifest.json via host.js).
   function hostPlatform() {
-    var h = (location.hostname || "").toLowerCase();
-    if (/(^|\.)ringg\.ai$/.test(h)) return RINGG;
-    if (/devrezolv\.com$/.test(h) || /gorezolv\.com$/.test(h)) return REZOLV;
-    return "";
+    try { return (window.PPHost && window.PPHost.layout()) || ""; } catch (e) { return ""; }
   }
+  // Files exported by v4.0.0 keyed the layouts by the platform's own name; those
+  // keys were 5 and 6 letters long (5-field and 2-field layout respectively).
+  function normPlatform(p) {
+    p = String(p || "").toLowerCase();
+    if (p === DASH5 || p === DASH2 || !p) return p;
+    return p.length === 5 ? DASH5 : p.length === 6 ? DASH2 : p;
+  }
+  function layoutLabel(p) { p = normPlatform(p); return p === DASH5 ? "5-field dashboard" : p === DASH2 ? "2-field dashboard" : "dashboard"; }
 
   // ------------------------------------------------------------------ type maps
-  // Rezolv has TWO DIFFERENT type dropdowns (confirmed live, Raj):
+  // Dash2 has TWO DIFFERENT type dropdowns (confirmed live, Raj):
   //   - Custom VARIABLES: String, Date
   //   - Custom ANALYSIS KEYS: String, Number, Boolean, String[]   (no Date)
-  // Ringg key/variable types: String, Number, Integer, Boolean, Array, Date, DateTime.
-  var REZOLV_VAR_TYPES = ["String", "Date"];
-  var REZOLV_KEY_TYPES = ["String", "Number", "Boolean", "String[]"];
+  // Dash5 key/variable types: String, Number, Integer, Boolean, Array, Date, DateTime.
+  var DASH2_VAR_TYPES = ["String", "Date"];
+  var DASH2_KEY_TYPES = ["String", "Number", "Boolean", "String[]"];
 
   function norm(s) { return String(s == null ? "" : s).trim().toLowerCase(); }
 
-  // Ringg stores languages as locale CODES (ta-IN, en-IN); Rezolv uses display
+  // Dash5 stores languages as locale CODES (ta-IN, en-IN); Dash2 uses display
   // NAMES (Tamil, English). Map by the base code.
   var LANG_CODE_NAME = {
     en: "English", hi: "Hindi", ta: "Tamil", te: "Telugu", kn: "Kannada",
@@ -75,21 +81,32 @@
     return String(v);
   }
 
-  // Ringg ANALYSIS KEY type -> Rezolv analysis key type (REQ-2 lives here).
-  function mapKeyTypeRinggToRezolv(t) {
-    switch (norm(t)) {
-      case "integer": case "number": case "float": case "double": return { type: "Number", flagged: false };
-      case "boolean": case "bool":                                 return { type: "Boolean", flagged: false };
-      case "array": case "string[]": case "list":                  return { type: "String[]", flagged: false };
-      case "string": case "":                                      return { type: "String", flagged: false };
-      // Rezolv's KEY dropdown has no Date -> fall back to String, flagged.
-      case "date": case "datetime": case "time":                   return { type: "String", flagged: true, from: t };
-      default:                                                      return { type: "String", flagged: true, from: t };
+  // Dash5 ANALYSIS KEY type -> Dash2 analysis key type (REQ-2 lives here).
+  function mapKeyTypeDash5ToDash2(t) {
+    // Normalise spelling: case, spaces, and wrappers like array<string> / list[str].
+    var n = norm(t).replace(/\s+/g, "");
+    if (/^(array|list)(<|\[|\()?(string|str|text)?(>|\]|\))?$/.test(n) || n === "string[]" || n === "str[]" || n === "[string]" || n === "stringarray" || n === "string_array" || n === "array_of_strings")
+      return { type: "String[]", flagged: false };
+    switch (n) {
+      case "integer": case "int": case "int32": case "int64": case "long": case "short":
+      case "number": case "float": case "double": case "decimal": case "numeric": case "real":
+        return { type: "Number", flagged: false };
+      case "boolean": case "bool":
+        return { type: "Boolean", flagged: false };
+      case "string": case "str": case "text": case "":
+        return { type: "String", flagged: false };
+      // The 2-field dashboard's analysis key dropdown has no Date -> String, flagged.
+      case "date": case "datetime": case "time": case "timestamp":
+        return { type: "String", flagged: true, from: t, why: "this dashboard has no Date key type" };
+      default:
+        // Anything we don't recognise (object, json, array of numbers, ...) is never
+        // guessed silently: it becomes String and is flagged on screen.
+        return { type: "String", flagged: true, from: t, why: "no matching key type on this dashboard" };
     }
   }
 
-  // Ringg VARIABLE type -> Rezolv variable type (dropdown = String/Date only).
-  function mapVarTypeRinggToRezolv(t) {
+  // Dash5 VARIABLE type -> Dash2 variable type (dropdown = String/Date only).
+  function mapVarTypeDash5ToDash2(t) {
     switch (norm(t)) {
       case "date": case "datetime": return { type: "Date", flagged: false };
       case "string": case "":       return { type: "String", flagged: false };
@@ -97,9 +114,9 @@
     }
   }
 
-  // Rezolv -> Ringg is clean (Ringg is a superset): keep the base type, strip []
-  // array marker into Ringg's "Array".
-  function mapKeyTypeRezolvToRingg(t) {
+  // Dash2 -> Dash5 is clean (Dash5 is a superset): keep the base type, strip []
+  // array marker into Dash5's "Array".
+  function mapKeyTypeDash2ToDash5(t) {
     var n = norm(t);
     if (n === "string[]" || /\[\]$/.test(n)) return { type: "Array", flagged: false };
     if (n === "number") return { type: "Number", flagged: false };
@@ -109,15 +126,15 @@
   }
 
   // ------------------------------------------------------------------ event map
-  // Ringg stored event keys  <->  Rezolv UI events.
-  // Rezolv has exactly 3 events (confirmed live): Transcript ready, Recording
-  // ready, Analysis completed. Ringg's two analysis events collapse into
-  // Rezolv's single "Analysis completed".
-  // Raj's rule: when importing INTO Rezolv, ALWAYS select all 3 events per
-  // webhook (see enforceRezolvAllEvents). The map below is kept for fidelity /
-  // Ringg-destination use.
-  var REZOLV_EVENTS = ["Transcript ready", "Recording ready", "Analysis completed"];
-  var RINGG_TO_REZOLV_EVENT = {
+  // Dash5 stored event keys  <->  Dash2 UI events.
+  // Dash2 has exactly 3 events (confirmed live): Transcript ready, Recording
+  // ready, Analysis completed. Dash5's two analysis events collapse into
+  // Dash2's single "Analysis completed".
+  // Raj's rule: when importing INTO Dash2, ALWAYS select all 3 events per
+  // webhook (see enforceDash2AllEvents). The map below is kept for fidelity /
+  // Dash5-destination use.
+  var DASH2_EVENTS = ["Transcript ready", "Recording ready", "Analysis completed"];
+  var DASH5_TO_DASH2_EVENT = {
     "transcript_completed": "Transcript ready",
     "transcript_ready": "Transcript ready",
     "recording_completed": "Recording ready",
@@ -128,9 +145,9 @@
     "analysis_completed": "Analysis completed"
   };
 
-  function enforceRezolvAllEvents(/* events */) {
-    // Raj: always subscribe to all 3 on a Rezolv destination.
-    return REZOLV_EVENTS.slice();
+  function enforceDash2AllEvents(/* events */) {
+    // Raj: always subscribe to all 3 on a Dash2 destination.
+    return DASH2_EVENTS.slice();
   }
 
   // ------------------------------------------------------------- deep-search util
@@ -245,7 +262,7 @@
 
   // ---- 4. Custom Analysis (prompt + keys) (REQ-2 for key types) -----------
   function extractAnalysis(agent) {
-    // Real Ringg shape: custom_analysis_prompt = { prompt, keys:{name:type}, defaults:{name:val} }.
+    // Real Dash5 shape: custom_analysis_prompt = { prompt, keys:{name:type}, defaults:{name:val} }.
     var node = findValue(agent, [
       "custom_analysis_prompt", "customanalysisprompt",
       "advanced_analysis", "post_call_analysis", "custom_analysis", "analysis"
@@ -270,7 +287,7 @@
         }
       });
     } else if (keysSrc && typeof keysSrc === "object") {
-      // name -> type MAP (the real Ringg shape); defaults is a parallel name -> value map.
+      // name -> type MAP (the real Dash5 shape); defaults is a parallel name -> value map.
       Object.keys(keysSrc).forEach(function (name) {
         var v = keysSrc[name];
         var type = (typeof v === "string") ? v : ((v && typeof v === "object") ? (pickStr(v, ["type", "data_type"]) || "String") : "String");
@@ -306,7 +323,7 @@
   }
 
   // ---- 5. Tools: parsed from api-tool-fields captures (per phase) ---------
-  // Ringg endpoint: /ca/api/v0/agent/api-tool-fields/{id}?version_id=..&phase=pre_call|on_call|post_call
+  // Dash5 endpoint: /ca/api/v0/agent/api-tool-fields/{id}?version_id=..&phase=pre_call|on_call|post_call
   // These flow through the interceptor when the user opens the Tools tab.
   var PHASES = ["pre_call", "on_call", "post_call"];
   // ASSISTANT-LEVEL tools (Raj): the bot's own per-phase tools live in the agent
@@ -329,9 +346,18 @@
   // as not-portable — reported, never silently dropped or (worse) exported as a
   // broken empty API tool. The skip is on the API-vs-non-API axis, NOT
   // workspace-vs-assistant (all of these are assistant-level).
+  // Any API-flavoured type: API_TOOL, api, custom_api, and the per-phase variants
+  // such as pre_call_api_tool (seen live 2026-11-02 on a "greetings" pre-call tool).
+  function isApiType(tt) { return /(^|_)api(_tool)?$/.test(tt); }
+  function toolUrl(t) {
+    var cfg = (t && t.config) || {};
+    var u = pickStr(cfg, ["url", "api_url", "endpoint"]) || pickStr(t || {}, ["url", "api_url", "endpoint"]);
+    if (!u) { var deep = findValue(t || {}, ["url", "api_url", "endpoint", "request_url"]); if (typeof deep === "string") u = deep.trim(); }
+    return u || "";
+  }
   function isApiTool(t) {
     var tt = norm(t && (t.tool_type || t.type));
-    if (tt) return tt === "api_tool" || tt === "api" || tt === "custom_api";
+    if (tt) return isApiType(tt);
     // No explicit type: treat as an API tool only if it actually has a URL.
     var cfg = (t && t.config) || {};
     return !!(pickStr(cfg, ["url", "api_url", "endpoint"]) || pickStr(t || {}, ["url"]));
@@ -351,12 +377,18 @@
                          toolType: pickStr(t, ["tool_type", "type"]) });
           return;
         }
+        if (!toolUrl(t)) {
+          // An API tool with no URL anywhere can't be rebuilt -- say so precisely.
+          skipped.push({ phase: phase, name: pickStr(t, ["tool_name", "name", "label"]),
+                         toolType: pickStr(t, ["tool_type", "type"]), why: "API tool, but no URL was found in its settings" });
+          return;
+        }
         var cfg = t.config || {};
         byPhase[phase].push({
           phase: phase,
           name: pickStr(t, ["tool_name", "name", "label"]),
           method: (pickStr(cfg, ["method", "http_method"]) || pickStr(t, ["method"]) || "POST").toUpperCase(),
-          url: pickStr(cfg, ["url", "api_url", "endpoint"]) || pickStr(t, ["url"]),
+          url: toolUrl(t),
           enabled: findValue(t, ["is_enabled"]) !== false,
           raw: t  // full tool definition (config.headers/body/... — CONTAINS CREDENTIALS)
         });
@@ -375,13 +407,13 @@
     return byPhase;
   }
 
-  // Normalize a captured tool into the fields the Rezolv "+ API" form needs.
+  // Normalize a captured tool into the fields the Dash2 "+ API" form needs.
   // Source field names vary (CONFIRM@TEST): defensively deep-search `raw`.
   // Returns { name, method, url, headers:[{key,value}], query:[{key,value}], body }.
   // A tool line item is either a STATIC value (e.g. Content-Type: application/json)
   // or a VARIABLE reference (e.g. body field client_loan_id -> {{client_loan_id}}).
   // The import must reproduce each in the same manner, so capture `kind` here.
-  // The line item's kind. Ringg's `type` is not limited to static/variable — it
+  // The line item's kind. Dash5's `type` is not limited to static/variable — it
   // can be other values too — so we PRESERVE the explicit type verbatim
   // (normalizing only the obvious static/variable synonyms), and only fall back
   // to value-shape inference when no explicit type is given. This keeps export
@@ -390,7 +422,7 @@
     var t = norm(it && (it.kind || it.type || it.source || it.value_type || it.valueType || it.field_type));
     if (it && (it.is_variable === true || it.isVariable === true)) return "variable";
     if (t) {
-      // Ringg line-item types (the ⇄ toggle): Static, Variable, JQ, Dynamic.
+      // Dash5 line-item types (the ⇄ toggle): Static, Variable, JQ, Dynamic.
       // Keep them distinct — "dynamic" and "jq" are NOT the same as "variable".
       if (/^(variable|custom_variable|customvariable|var)$/.test(t)) return "variable";
       if (/^(static|constant|fixed|value|literal)$/.test(t)) return "static";
@@ -403,7 +435,7 @@
     return "static";
   }
   // A variable value references a SOURCE (the ⇄ toggle sets static vs variable;
-  // within variable the value picks a source). Ringg sources seen live:
+  // within variable the value picks a source). Dash5 sources seen live:
   //   custom_args (custom variables), call_data (call metadata),
   //   platform_analysis, client_analysis, tool_output (another tool's output).
   // Only custom_args binds to a custom variable on the destination; the others
@@ -473,13 +505,36 @@
     };
   }
 
+  // JQ on the 2-field dashboard (confirmed live 2026-11-02 with send_payment_link):
+  // a JQ row's input is the variables object itself, so a variable is `.total_due`,
+  // not `.custom_args.total_due` (the server rejects that with "references
+  // undeclared variable(s): [custom_args]"). Variable rows keep custom_args.<name>.
+  // The JQ field also takes the bare expression: no surrounding backticks (those
+  // only appear in the JSON-editor/cURL view) -- they fail with 'unexpected token "`"'.
+  function jqForDash2(expr) {
+    var v = String(expr == null ? "" : expr).trim();
+    var orig = v;
+    if (v.length > 1 && v.charAt(0) === "`" && v.charAt(v.length - 1) === "`") v = v.slice(1, -1).trim();
+    // Only a ROOT path: preceded by start, space or an operator/bracket -- never
+    // by an identifier, ] or ) (which would make it a nested field of something else).
+    // Rewrite code only -- never text inside a "string literal".
+    var parts = v.split(/("(?:[^"\\]|\\.)*")/);
+    for (var i = 0; i < parts.length; i += 2) {
+      parts[i] = parts[i]
+        .replace(/(^|[^A-Za-z0-9_\]\)'$])\.custom_args\.(?=[A-Za-z_"]|$)/g, "$1.")
+        .replace(/(^|[^A-Za-z0-9_\]\)'$])\.custom_args\[/g, "$1.[");
+    }
+    v = parts.join("");
+    return { value: v, changed: v !== orig };
+  }
+
   // ------------------------------------------------------------------ bot name/id
   function botIdentity(agentRaw) {
     // Identity must read TOP-LEVEL fields only: a deep-search for "name" would
     // grab a nested custom-variable's name (e.g. "callee_name") instead of the
     // bot's own name. Shallow-pick on the unwrapped agent object.
     var a = unwrap(agentRaw) || agentRaw || {};
-    // Real Ringg envelope nests the agent under agents:[{...}].
+    // Real Dash5 envelope nests the agent under agents:[{...}].
     if (a && a.agents && Array.isArray(a.agents) && a.agents[0]) a = a.agents[0];
     else if (a && a.agents && typeof a.agents === "object") a = a.agents;
     function shallow(cands) {
@@ -553,14 +608,14 @@
     };
     skippedTools.forEach(function (t) {
       config.notes.push("Tool '" + (t.name || "(unnamed)") + "' (" + (t.toolType || "non-API") +
-        (t.phase ? ", " + t.phase : "") + ") is not a cURL/API tool — not ported.");
+        (t.phase ? ", " + t.phase : "") + ") " + (t.why ? "— " + t.why + " — not ported." : "is not a cURL/API tool — not ported."));
     });
 
     return { ok: true, config: config };
   }
 
   // Assemble the downloadable Magic Port ZIP: the existing prompt .md files +
-  // magicport.json. Reuses RinggZip.
+  // magicport.json. Reuses PPZip.
   function buildZipFiles(config, promptFiles) {
     var files = (promptFiles || []).slice();
     files.push({ name: CONFIG_NAME, content: JSON.stringify(config, null, 2) });
@@ -569,7 +624,7 @@
       name: "README-magicport.txt",
       content:
         "PromptPort — Magic Port export\n" +
-        "Bot: " + (config.source.botName || "(unnamed)") + "  [" + config.source.platform + "]\n" +
+        "Bot: " + (config.source.botName || "(unnamed)") + "  [" + layoutLabel(config.source.platform) + "]\n" +
         "Exported: " + config.source.exportedAt + "\n\n" +
         (config.containsCredentials
           ? "⚠ CONTAINS CREDENTIALS: tool cURLs and/or webhook URLs may include API keys,\n" +
@@ -585,40 +640,56 @@
   // Cross-platform mapping of a parsed config for a given destination platform.
   // Returns the destination-ready data plus the flags/notes to show the user.
   function mapForDestination(config, destPlatform) {
+    destPlatform = normPlatform(destPlatform);   // accept legacy names from older builds/tests
     var notes = [];
-    var src = config.source ? config.source.platform : "";
+    var src = normPlatform(config.source ? config.source.platform : "");
     var data = config.data || {};
     var lv = data.languageVoice || {};
-    var outLV = (destPlatform === REZOLV)
+    var outLV = (destPlatform === DASH2)
       ? { primaryLanguage: langToName(lv.primaryLanguage), secondaryLanguage: langToName(lv.secondaryLanguage) }
       : lv;
     var out = { variables: [], languageVoice: outLV, analysis: null, tools: data.tools || {}, events: [] };
 
+    // Tools: say which JQ expressions will be adapted for this dashboard.
+    if (destPlatform === DASH2) {
+      ["pre_call", "on_call", "post_call"].forEach(function (ph) {
+        ((data.tools || {})[ph] || []).forEach(function (t) {
+          var parts; try { parts = extractToolParts(t); } catch (e) { return; }
+          var n = 0;
+          ["headers", "query", "path", "body"].forEach(function (sec) {
+            (parts[sec] || []).forEach(function (it) { if (it.kind === "jq" && jqForDash2(it.value).changed) n++; });
+          });
+          if (n) notes.push("Tool '" + (parts.name || "(unnamed)") + "': " + n + " JQ expression" + (n > 1 ? "s" : "") +
+            " adapted for this dashboard (.custom_args.<name> → .<name>).");
+        });
+      });
+    }
+
     // Variables
     (data.variables || []).forEach(function (v) {
-      if (destPlatform === REZOLV) {
-        // Raj (2026-10-31): Ringg has NO type on custom variables, so on a
-        // Rezolv destination they are always String. The exporter already
+      if (destPlatform === DASH2) {
+        // Raj (2026-10-31): Dash5 has NO type on custom variables, so on a
+        // Dash2 destination they are always String. The exporter already
         // defaults to "String" when the source says nothing; this makes the
         // rule explicit rather than leaving it to a default two layers away.
         // If a source ever did carry a real type we do not drop it silently --
-        // it is noted once -- but from Ringg this cannot happen.
+        // it is noted once -- but from Dash5 this cannot happen.
         var srcType = norm(v.type);
         if (srcType && srcType !== "string") {
           notes.push("Variable '" + v.name + "': source type " + v.type +
-                     " ignored — Rezolv custom variables are created as String.");
+                     " ignored — custom variables on this dashboard are created as String.");
         }
         out.variables.push({ name: v.name, type: "String" });
       } else {
         out.variables.push({ name: v.name, type: v.type || "String" });
       }
     });
-    // Direction rule: on a Rezolv destination, ensure mobile_number + callee_name exist.
-    if (destPlatform === REZOLV) {
+    // Direction rule: on a Dash2 destination, ensure mobile_number + callee_name exist.
+    if (destPlatform === DASH2) {
       ["mobile_number", "callee_name"].forEach(function (n) {
         if (!out.variables.some(function (v) { return v.name === n; })) {
           out.variables.push({ name: n, type: "String" });
-          notes.push("Added system variable '" + n + "' (required on Rezolv, default on Ringg).");
+          notes.push("Added system variable '" + n + "' (required on this dashboard).");
         }
       });
     }
@@ -626,12 +697,12 @@
     // Custom Analysis keys
     var an = data.customAnalysis || { prompt: "", keys: [] };
     var keys = (an.keys || []).map(function (k) {
-      if (destPlatform === REZOLV) {
-        var m = mapKeyTypeRinggToRezolv(k.type);
-        if (m.flagged) notes.push("Analysis key '" + k.name + "': type " + (m.from || k.type) + " -> String (no Date in Rezolv key types).");
+      if (destPlatform === DASH2) {
+        var m = mapKeyTypeDash5ToDash2(k.type);
+        if (m.flagged) notes.push("Analysis key '" + k.name + "': type " + (m.from || k.type) + " -> String (" + (m.why || "no matching key type on this dashboard") + ").");
         return { name: k.name, type: m.type, required: k.required !== false };
       } else {
-        var mm = mapKeyTypeRezolvToRingg(k.type);
+        var mm = mapKeyTypeDash2ToDash5(k.type);
         return { name: k.name, type: mm.type, default: k.default || "" };
       }
     });
@@ -640,15 +711,15 @@
     // Events
     (data.events || []).forEach(function (w) {
       var events;
-      if (destPlatform === REZOLV) {
-        events = enforceRezolvAllEvents(w.events);   // Raj: always all 3
+      if (destPlatform === DASH2) {
+        events = enforceDash2AllEvents(w.events);   // Raj: always all 3
       } else {
         events = (w.events || []);
       }
       out.events.push({ url: w.url, method: w.method || "POST", events: events });
     });
 
-    // Tools: phase-match; flag phases the destination can't accept (e.g. Rezolv
+    // Tools: phase-match; flag phases the destination can't accept (e.g. Dash2
     // QA has no Pre-Call). content.js checks live phase availability at import.
     return { ok: true, data: out, notes: notes };
   }
@@ -680,7 +751,8 @@
   window.MagicPort = {
     FORMAT: FORMAT,
     CONFIG_NAME: CONFIG_NAME,
-    RINGG: RINGG, REZOLV: REZOLV,
+    DASH5: DASH5, DASH2: DASH2,
+    normPlatform: normPlatform, layoutLabel: layoutLabel,
     hostPlatform: hostPlatform,
     // extraction
     pickAgent: pickAgent,
@@ -689,9 +761,10 @@
     // mapping / validation
     mapForDestination: mapForDestination,
     extractToolParts: extractToolParts,
-    mapKeyTypeRinggToRezolv: mapKeyTypeRinggToRezolv,
-    mapVarTypeRinggToRezolv: mapVarTypeRinggToRezolv,
-    enforceRezolvAllEvents: enforceRezolvAllEvents,
+    jqForDash2: jqForDash2,
+    mapKeyTypeDash5ToDash2: mapKeyTypeDash5ToDash2,
+    mapVarTypeDash5ToDash2: mapVarTypeDash5ToDash2,
+    enforceDash2AllEvents: enforceDash2AllEvents,
     verifyVariables: verifyVariables,
     verifyKeyTypes: verifyKeyTypes,
     isMagicPortZip: isMagicPortZip,

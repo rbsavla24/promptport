@@ -2,7 +2,7 @@
 
 # PromptPort
 
-**Export, import and find-and-replace voice-bot prompts as clean Markdown — right inside Ringg AI and Rezolv.AI.**
+**Export, import and find-and-replace voice-bot prompts as clean Markdown — right inside your voice-bot dashboard.**
 
 Back up a bot in one click. Move a prompt between assistants or between platforms. Review every change before it touches the page.
 
@@ -16,7 +16,7 @@ Back up a bot in one click. Move a prompt between assistants or between platform
 </div>
 
 <p align="center">
-  <img src="docs/promptport-hero.png" alt="The PromptPort panel: export in one click, review every change before import, undo anytime, and find &amp; replace across the whole bot" width="100%">
+  <img src="docs/promptport-hero.png" alt="The PromptPort v4 panel: export in one click (including the Magic Port full-bot export), review every change before import, undo anytime, find &amp; replace across the whole bot, and Magic Port migration with a consent check" width="100%">
 </p>
 
 ---
@@ -35,8 +35,8 @@ Prompt teams end up copy-pasting between tabs, losing formatting, breaking varia
 
 | Platform | Where it runs | What it reads and writes |
 | --- | --- | --- |
-| **Ringg AI** | Assistant pages on `*.ringg.ai` | 5 sections: First Message, Objective, Response Guidelines, Conversation Script, FAQs |
-| **Rezolv.AI Voicebot Panel** | Voice-agent pages on `panels.gorezolv.com/voicebot/` and `panels.qa.devrezolv.com/voicebot/` | 2 prompt fields: First Message, Main Prompt. With Magic Port also: custom variables, language, custom analysis, on-call tools and event subscriptions |
+| **5-field dashboard** | Assistant pages of the supported 5-field dashboard | 5 sections: First Message, Objective, Response Guidelines, Conversation Script, FAQs |
+| **2-field dashboard** | Voice-agent pages of the supported 2-field dashboard (production and QA) | 2 prompt fields: First Message, Main Prompt. With Magic Port also: custom variables, language, custom analysis, on-call tools and event subscriptions |
 
 The extension only activates on these two sites. It has no access to any other page.
 
@@ -75,27 +75,27 @@ The extension only activates on these two sites. It has no access to any other p
 - **Download backup** saves the "before" version as a ZIP.
 
 ### Move bots between platforms
-- Import a **Ringg 5-bucket export into Rezolv** and the four prompt sections are combined into Main Prompt under `#` headings.
-- Import a **2-bucket file into Ringg** and Main Prompt is split back into the four sections by its headings.
-- Import only one section (for example, just FAQs) and only that part changes — on Rezolv, the other `#` sections inside Main Prompt are kept.
+- Import a **5-bucket export into a 2-field dashboard** and the four prompt sections are combined into Main Prompt under `#` headings.
+- Import a **2-bucket file into a 5-field dashboard** and Main Prompt is split back into the four sections by its headings.
+- Import only one section (for example, just FAQs) and only that part changes — on a 2-field dashboard, the other `#` sections inside Main Prompt are kept.
 
 ```mermaid
 flowchart LR
-    A[Ringg assistant<br/>5 sections] -- Export 5-bucket ZIP --> M[(Markdown files<br/>in Git / your editor)]
-    M -- Import --> B[Rezolv agent<br/>First Message + Main Prompt]
+    A[5-field dashboard<br/>5 sections] -- Export 5-bucket ZIP --> M[(Markdown files<br/>in Git / your editor)]
+    M -- Import --> B[2-field dashboard<br/>First Message + Main Prompt]
     B -- Export 2-bucket ZIP --> M
     M -- Import --> A
 ```
 
 ### Magic Port — move the whole bot, not just the prompt
 
-Everything above moves *prompt text*. **Magic Port** moves a bot's **configuration** as well: export a complete bot from Ringg as a single ZIP, then import it into a Rezolv agent.
+Everything above moves *prompt text*. **Magic Port** moves a bot's **configuration** as well: export a complete bot from a 5-field dashboard as a single ZIP, then import it into a bot on a 2-field dashboard.
 
 | What moves | Notes |
 | --- | --- |
 | **Prompt** (First Message, Main Prompt) | Travels as the same Markdown buckets the normal export uses |
-| **Custom variables** | Created on the destination. Ringg has no type on variables, so they arrive as `String` |
-| **Language** | Primary and secondary, mapped from locale codes to Rezolv's names (`hi-IN` → Hindi) |
+| **Custom variables** | Created on the destination. The source has no type on variables, so they arrive as `String` |
+| **Language** | Primary and secondary, mapped from locale codes to the destination's language names (`hi-IN` → Hindi) |
 | **Custom analysis** | The system prompt plus the required keys, each with its type (`String` / `Number` / `Boolean` / `String[]`) |
 | **Tools** | On-call API tools: method, URL, headers, query, path and body rows, including variables bound through the picker |
 | **Event subscriptions** | Each webhook URL with its events |
@@ -103,8 +103,8 @@ Everything above moves *prompt text*. **Magic Port** moves a bot's **configurati
 **What it does *not* move**, by design or by platform limit:
 
 - **Voice and speaking speed** are not ported — only the languages.
-- **Pre-call and post-call tools cannot be migrated.** Rezolv's Voicebot panel currently shows *"Coming soon."* for both phases and offers no way to add an API there, so a bot whose tools are all pre-call migrates zero tools. Every skipped tool is listed by name on the results screen rather than silently dropped. If Rezolv enables those phases, Magic Port will use them without needing a code change.
-- **Non-API Ringg tools** — callback-schedule, calendar, form, quick-reply and WhatsApp widgets — have no Rezolv equivalent and are reported as out of scope.
+- **Pre-call and post-call tools cannot be migrated.** The destination dashboard currently shows *"Coming soon."* for both phases and offers no way to add an API there, so a bot whose tools are all pre-call migrates zero tools. Every skipped tool is listed by name on the results screen rather than silently dropped. If the destination enables those phases, Magic Port will use them without needing a code change.
+- **Non-API tools** — callback-schedule, calendar, form, quick-reply and WhatsApp widgets — have no equivalent on the destination and are reported as out of scope.
 
 **It adds; it does not delete.** Variables, tools and subscriptions already on the destination that the source doesn't have are left exactly where they are, and listed in the results so you can see the difference. Nothing is ever removed from the destination bot.
 
@@ -114,8 +114,8 @@ Everything above moves *prompt text*. **Magic Port** moves a bot's **configurati
 
 ```mermaid
 flowchart LR
-    R[Ringg assistant<br/>prompt + variables + tools<br/>+ analysis + webhooks] -- Magic Port export --> Z[(Single ZIP)]
-    Z -- Magic Port import --> V[Rezolv agent<br/>configured to match]
+    R[Source bot · 5-field dashboard<br/>prompt + variables + tools<br/>+ analysis + webhooks] -- Magic Port export --> Z[(Single ZIP)]
+    Z -- Magic Port import --> V[Destination bot · 2-field dashboard<br/>configured to match]
 ```
 
 ### Find & replace across the whole bot
@@ -139,7 +139,7 @@ PromptPort is a standard Chrome (Manifest V3) extension. It should also load in 
    *(Or clone this repository and use the `extension` folder.)*
 2. Open `chrome://extensions` and switch on **Developer mode** (top right).
 3. Click **Load unpacked** and select the unzipped folder (the one containing `manifest.json`).
-4. Open an assistant on Ringg AI or a voice agent's Prompt tab on Rezolv.AI. The PromptPort button appears in the bottom-right corner.
+4. Open an assistant on the 5-field dashboard, or a voice agent's Prompt tab on the 2-field dashboard. The PromptPort button appears in the bottom-right corner.
 
 > **Work laptop with managed extensions?** Ask your IT admin to allow the extension. The [permissions](#permissions) section below is written for them.
 
@@ -148,11 +148,11 @@ PromptPort is a standard Chrome (Manifest V3) extension. It should also load in 
 ## How it works
 
 ### Export
-1. Open the assistant (Ringg) or the agent's **Prompt** tab (Rezolv).
+1. Open the assistant (5-field dashboard) or the agent's **Prompt** tab (2-field dashboard).
 2. Click the **PromptPort** button in the bottom-right corner.
 3. Choose **Download 5 Buckets** or **Download 2 Buckets**.
 
-> On Rezolv, **Download 5 Buckets** switches on once Main Prompt is organised under `# Objective`, `# Response Guidelines`, `# Conversation Flow` and `# FAQs`. The panel shows which headings it found and which are missing.
+> On a 2-field dashboard, **Download 5 Buckets** switches on once Main Prompt is organised under `# Objective`, `# Response Guidelines`, `# Conversation Flow` and `# FAQs`. The panel shows which headings it found and which are missing.
 
 ### Import
 1. Open the **Import** tab and drop a `.zip` or `.md` file (or click to choose one).
@@ -161,8 +161,8 @@ PromptPort is a standard Chrome (Manifest V3) extension. It should also load in 
 4. Check the page, then press **Save** on the site to keep the changes — or **Undo import** to go back.
 
 ### Magic Port
-1. On the Ringg assistant you want to copy, open the panel and click **Magic Port**. You get one ZIP holding the prompt and the configuration.
-2. Open the destination Rezolv agent — ideally a **blank** one — and drop that ZIP into the **Import** tab.
+1. On the 5-field dashboard, open the assistant you want to copy, open the panel and click **Magic Port**. You get one ZIP holding the prompt and the configuration.
+2. On the 2-field dashboard, open the destination agent — ideally a **blank** one — and drop that ZIP into the **Import** tab.
 3. Read the summary: it lists what will be migrated and what won't (non-API tools, pre/post-call tools).
 4. Tick the consent box and confirm. Magic Port works through the agent's tabs, saving each section as it finishes.
 5. Read the results screen. Anything it could not write is listed by name — nothing fails silently.
@@ -227,15 +227,15 @@ Writing files by hand? A line break you type stays a line break, and `@{{variabl
 | --- | --- |
 | `clipboardRead`, `clipboardWrite` | Copies each section exactly as the site's editor formats it (variables, tables, lists). Your clipboard is put back afterwards. |
 | `activeTab`, `scripting` | Lets the toolbar popup check the current page and open the panel. |
-| Host access to `*.ringg.ai`, `panels.gorezolv.com` and `panels.qa.devrezolv.com` | The only sites the extension runs on. The QA host is included so a migration can be rehearsed before touching production. |
+| Host access to the supported dashboards (listed in `manifest.json`) | The only sites the extension runs on. A QA host is included so a migration can be rehearsed before touching production. |
 
-On Ringg, a small page script notices the assistant data the dashboard already loads, which helps name your ZIP files. It only ever repeats read-only requests, never a save.
+On the 5-field dashboard, a small page script notices the assistant data the dashboard already loads, which helps name your ZIP files. It only ever repeats read-only requests, never a save.
 
 ---
 
 ## FAQ
 
-**Does PromptPort save anything to Ringg or Rezolv?**
+**Does PromptPort save anything to the dashboard?**
 For a prompt import, no — it writes into the editor exactly as if you had pasted it, and you review it and press Save yourself. **Magic Port is different**: it migrates a whole configuration, so it has to press Save for you, section by section. That import asks you to tick a consent box first, and it only ever adds — it never deletes anything already on the destination bot.
 
 **What if an import goes wrong?**
@@ -244,11 +244,11 @@ Click **Undo import** — on the results screen or later from the Import tab. Ev
 **Will my variables survive?**
 Yes. Chips export as `@{{name}}` and come back as real chips on import. Find & replace never edits a chip's name.
 
-**Can I copy a bot from Ringg to Rezolv?**
-Yes. Export a 5-bucket ZIP from Ringg and import it on Rezolv. The sections are combined into Main Prompt under `#` headings. It works the other way too.
+**Can I copy a bot from a 5-field dashboard to a 2-field dashboard?**
+Yes. Export a 5-bucket ZIP from the 5-field dashboard and import it on the 2-field dashboard. The sections are combined into Main Prompt under `#` headings. It works the other way too.
 
 **Can Magic Port copy my pre-call tools?**
-Not today, and not because of the extension. Rezolv's Voicebot panel shows *"Coming soon."* for both the Pre Call and Post Call phases and gives no way to add an API there, so those tools have nowhere to go. They are listed by name on the results screen so you know exactly what was left behind. When Rezolv enables those phases, Magic Port picks them up automatically.
+Not today, and not because of the extension. The destination dashboard shows *"Coming soon."* for both the Pre Call and Post Call phases and gives no way to add an API there, so those tools have nowhere to go. They are listed by name on the results screen so you know exactly what was left behind. When the destination enables those phases, Magic Port picks them up automatically.
 
 **What happens if the destination bot already has variables or webhooks?**
 They stay. Magic Port adds and updates; it never deletes. Anything on the destination that isn't in the source is reported back to you as "left in place" so you can decide what to do with it.
@@ -267,16 +267,16 @@ No. There is no server, no analytics and no tracking. Everything happens in your
 ## Good to know
 
 - PromptPort reads the editors on the page, so a large redesign of either dashboard could need an update. Please [open an issue](../../issues) if something stops working.
-- On Ringg, re-importing a list can change its spacing class in the editor. The text and the exported Markdown are unaffected.
-- Collapsed sections on Ringg are opened automatically before reading.
-- Magic Port reads back everything it writes and re-checks it, because the Rezolv panel renders some lists a moment behind its own backend. Anything it could not confirm is named on the results screen instead of being reported as done.
+- On the 5-field dashboard, re-importing a list can change its spacing class in the editor. The text and the exported Markdown are unaffected.
+- Collapsed sections on the 5-field dashboard are opened automatically before reading.
+- Magic Port reads back everything it writes and re-checks it, because the destination dashboard renders some lists a moment behind its own backend. Anything it could not confirm is named on the results screen instead of being reported as done.
 - Rehearse a migration on a blank bot first. Magic Port adds rather than replaces, so importing twice into the same bot is safe for tools and webhooks, but variables will accumulate.
 
 ---
 
 ## Roadmap ideas
 
-- Magic Port in the Rezolv → Ringg direction (today it is Ringg → Rezolv only)
+- Magic Port in the 2-field → 5-field direction (today it is 5-field → 2-field only)
 - Porting voice and speaking speed alongside the languages
 - One-click "compare two assistants"
 - Export history inside the panel
@@ -296,7 +296,7 @@ Ideas and pull requests are welcome.
 
 ## Disclaimer
 
-PromptPort is an independent, community-built tool. It is not affiliated with, endorsed by, or sponsored by Ringg AI or Rezolv.AI. Product names are used only to describe compatibility, and all trademarks belong to their owners.
+PromptPort is an independent, community-built tool. It is not affiliated with, endorsed by, or sponsored by any voice-bot platform, and all trademarks belong to their owners.
 
 ---
 
