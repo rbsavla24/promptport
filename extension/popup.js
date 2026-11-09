@@ -5,7 +5,6 @@
   var statusEl = document.getElementById("status");
   var listEl = document.getElementById("list");
   var dlBtn = document.getElementById("dl");
-  var panelBtn = document.getElementById("panel");
 
   function activeTab(cb) {
     chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
@@ -52,7 +51,7 @@
     activeTab(function (tab) {
       if (!onSupportedPage(tab)) {
         statusEl.textContent = "Open a supported prompt page to use this.";
-        dlBtn.disabled = true; panelBtn.disabled = true;
+        dlBtn.disabled = true;
         return;
       }
       send(tab.id, { type: "get-status" }, function (resp) {
@@ -71,13 +70,6 @@
       if (!onSupportedPage(tab)) return;
       // Copying must happen under a real page click, so open the on-page panel
       // and let the user press Download there (guarantees a genuine copy).
-      send(tab.id, { type: "open-panel" }, function () { window.close(); });
-    });
-  });
-
-  panelBtn.addEventListener("click", function () {
-    activeTab(function (tab) {
-      if (!onSupportedPage(tab)) return;
       send(tab.id, { type: "open-panel" }, function () { window.close(); });
     });
   });

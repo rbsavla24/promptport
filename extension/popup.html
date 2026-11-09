@@ -22,8 +22,7 @@
     button + button { border-radius: var(--sk2); }
     button[hidden] { display: none; }
     #dl { background: var(--ink); color: #fff; box-shadow: 3px 3px 0 var(--steel); }
-    #panel { background: #fff; color: var(--ink); }
-    #dl:disabled, #panel:disabled { background: #fff repeating-linear-gradient(-45deg, var(--mist) 0 2px, transparent 2px 8px); color: var(--graphite); border-style: dashed; border-color: var(--steel); box-shadow: none; cursor: default; }
+    #dl:disabled { background: #fff repeating-linear-gradient(-45deg, var(--mist) 0 2px, transparent 2px 8px); color: var(--graphite); border-style: dashed; border-color: var(--steel); box-shadow: none; cursor: default; }
     button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
     .hint { font-size: 11px; color: var(--steel); margin-top: 10px; line-height: 1.5; }
   </style>
@@ -38,7 +37,6 @@
     <ul id="list"></ul>
     <div class="btns">
       <button id="dl">Open on page</button>
-      <button id="panel" hidden>Show on page</button>
     </div>
     <div class="hint">The download happens in the panel on the page: it copies each section with a real click (needed for an exact copy) and opens collapsed sections first.</div>
   </main>

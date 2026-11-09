@@ -19,7 +19,8 @@
     var host = m[2] === "*" ? "[^/]+" : (m[2].indexOf("*.") === 0 ? "(?:[^/]+\\.)?" + esc(m[2].slice(2)) : esc(m[2]));
     return {
       host: new RegExp("^" + host + "$", "i"),
-      url: new RegExp("^" + (m[1] === "*" ? "https?" : m[1]) + ":\\/\\/" + host + esc(m[3]).replace(/\\\*/g, ".*").replace(/\*/g, ".*") + "$", "i")
+      // Match patterns ignore the port (Chrome injects on any port), so does this.
+      url: new RegExp("^" + (m[1] === "*" ? "https?" : m[1]) + ":\\/\\/" + host + "(?::\\d+)?" + esc(m[3]).replace(/\\\*/g, ".*").replace(/\*/g, ".*") + "$", "i")
     };
   }
   var cache = null;

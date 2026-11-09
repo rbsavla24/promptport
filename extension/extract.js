@@ -85,8 +85,88 @@
     try {
       if (typeof turndownPluginGfm !== "undefined") _td.use(turndownPluginGfm.gfm);
     } catch (e) {}
+    _td.escape = ppEscape(_td.escape || TurndownService.prototype.escape);
     // Strikethrough as GFM "~~x~~" (the plugin default "~x~" isn't read back).
     _td.addRule("ppStrike", { filter: ["del", "s", "strike"], replacement: function (c) { return c.trim() ? "~~" + c + "~~" : c; } });
+    // Every table becomes a GFM table. TipTap lets the user switch the header
+    // row off (all <td>) or use a header COLUMN; the GFM plugin keeps those as
+    // raw HTML (chips leak out as <span>s). A markdown table always has a header
+    // row, so the FIRST row is promoted to it.
+    function ownerTable(node) {
+      var t = node.parentNode;
+      while (t && t.nodeName !== "TABLE") t = t.parentNode;
+      return t;
+    }
+    _td.addRule("ppTable", {
+      filter: function (node) { return node.nodeName === "TABLE" && !!(node.rows && node.rows.length); },
+      replacement: function (content) {
+        return "\n\n" + String(content).replace(/\n\n+/g, "\n").replace(/^\n+|\n+$/g, "") + "\n\n";
+      }
+    });
+    _td.addRule("ppTableRow", {
+      filter: "tr",
+      replacement: function (content, node) {
+        var t = ownerTable(node), border = "";
+        if (t && t.rows && t.rows[0] === node) {
+          var cells = [];
+          for (var i = 0; i < node.childNodes.length; i++) {
+            var c = node.childNodes[i];
+            if (c.nodeName !== "TH" && c.nodeName !== "TD") continue;
+            var al = (c.getAttribute("align") || "").toLowerCase();
+            cells.push(al === "left" ? ":--" : al === "right" ? "--:" : al === "center" ? ":-:" : "---");
+          }
+          if (cells.length) border = "| " + cells.join(" | ") + " |";
+        }
+        return "\n" + content + (border ? "\n" + border : "");
+      }
+    });
+    // Two lists in a row ("- a" list, then another "- b" list) would merge into
+    // ONE list on re-import. An empty HTML comment between them keeps them apart
+    // (the importer drops comments).
+    _td.addRule("ppList", {
+      filter: ["ul", "ol"],
+      replacement: function (content, node) {
+        var parent = node.parentNode;
+        if (parent && parent.nodeName === "LI" && parent.lastElementChild === node) return "\n" + content;
+        var prev = node.previousSibling;
+        while (prev && prev.nodeType === 3 && !/\S/.test(prev.nodeValue)) prev = prev.previousSibling;
+        var sep = (prev && prev.nodeName === node.nodeName && !(parent && parent.nodeName === "LI")) ? "<!-- -->\n\n" : "";
+        return "\n\n" + sep + content + "\n\n";
+      }
+    });
+    // List items: Turndown's own rule finds an <ol> item's number with
+    // indexOf(parent.children) for EVERY item (quadratic: a 20k-item list took
+    // a minute). Same output, the positions counted once per list.
+    var liIndex = typeof WeakMap === "function" ? new WeakMap() : null;
+    function itemIndex(parent, node) {
+      if (!liIndex) return Array.prototype.indexOf.call(parent.children, node);
+      var m = liIndex.get(parent);
+      if (!m) {
+        m = new Map();
+        for (var i = 0, k = parent.children; i < k.length; i++) m.set(k[i], i);
+        liIndex.set(parent, m);
+      }
+      return m.has(node) ? m.get(node) : Array.prototype.indexOf.call(parent.children, node);
+    }
+    _td.addRule("ppListItem", {
+      filter: "li",
+      replacement: function (content, node, options) {
+        var prefix = options.bulletListMarker + "   ";
+        var parent = node.parentNode;
+        if (parent && parent.nodeName === "OL") {
+          var start = parent.getAttribute("start");
+          var index = itemIndex(parent, node);
+          prefix = (start ? Number(start) + index : index + 1) + ".  ";
+        }
+        var isParagraph = /\n$/.test(content);
+        content = String(content).replace(/^\n+/, "");
+        var e = content.length;
+        while (e > 0 && content.charAt(e - 1) === "\n") e--;
+        content = content.substring(0, e) + (isParagraph ? "\n" : "");
+        content = content.replace(/\n/gm, "\n" + " ".repeat(prefix.length));
+        return prefix + content + (node.nextSibling ? "\n" : "");
+      }
+    });
     // Table cells: a literal "|" (e.g. the @||tool|| variable form) would split
     // the cell on re-import, so escape it as "\|" (GFM's own cell escape).
     _td.addRule("ppTableCell", {
@@ -95,7 +175,10 @@
         var idx = Array.prototype.indexOf.call(node.parentNode.childNodes, node);
         // Several lines/paragraphs/list items in one cell are kept with <br>
         // (a markdown table row must stay on one line).
-        var c = String(content).trim().replace(/[ \t]*\n+[ \t]*/g, "<br>").replace(/(\\*)\|/g, function (m, bs) { return bs.length % 2 ? m : bs + "\\|"; });
+        var c = String(content).trim()
+          // a list in a cell: "-   x" → "- x" (same as top-level lists)
+          .replace(/^([ \t]*[-*+])[ \t]{2,}/gm, "$1 ").replace(/^([ \t]*\d+\.)[ \t]{2,}/gm, "$1 ")
+          .replace(/[ \t]*\n+[ \t]*/g, "<br>").replace(/(\\*)\|/g, function (m, bs) { return bs.length % 2 ? m : bs + "\\|"; });
         return (idx === 0 ? "| " : " ") + c + " |";
       }
     });
@@ -104,54 +187,94 @@
     // token must come from data-id / data-label, NOT the rendered text.
     _td.addRule("ppMention", {
       filter: function (node) {
+        // Not the new 2-field editor's live-only decoration of a PLAIN {{x}}
+        // (span.mention-unknown-text): that is text, not a chip.
+        var cls = node.getAttribute("class") || "";
         return node.nodeName === "SPAN" &&
           (node.getAttribute("data-type") === "mention" ||
-           (node.getAttribute("class") || "").indexOf("mention") !== -1 ||
+           (cls.indexOf("mention") !== -1 && !/(^|\s)mention-unknown-text(\s|$)/.test(cls)) ||
            node.hasAttribute("data-id"));
       },
       replacement: function (node_content, node) {
         // Export the BARE token, not the HTML span — e.g. "@{{customer_name}}",
         // "@((greetings.date))", "@||send_payment_link||". A chip's own text is
         // exactly its token (verified across every variable & tool type); we do
-        // NOT reconstruct via mentionToken() (that force-wraps in {{ }} and would
+        // NOT force-wrap the id in {{ }} (that would
         // corrupt the (( )) and || || forms). Fall back to data-id only if empty.
         var t = (node.textContent || "").trim();
         // Dash2's chips show the bare token ("{{customer_name}}") and keep the
         // "@" in data-mention-suggestion-char — put it back so the markdown
         // token is the same "@{{…}}" form Dash5 exports (and import re-hydrates).
-        if (t && t.charAt(0) !== "@" && /^(\{\{[\s\S]*\}\}|\(\([\s\S]*\)\)|\|\|[\s\S]*\|\|)$/.test(t)) {
+        if (t && t.charAt(0) !== "@" && TOKEN_SHAPE.test(t)) {
           t = (node.getAttribute("data-mention-suggestion-char") || "@") + t;
         }
-        if (t) return t;
         var id = (node.getAttribute("data-id") || node.getAttribute("data-label") || "").trim();
-        return id ? ("@" + id.replace(/^@+/, "")) : "";
+        // The text is a friendly display label ("Callee Name"), not a token:
+        // the token is in data-id / data-label.
+        if (t && !TOKEN_SHAPE.test(t.replace(/^@+/, "")) && TOKEN_SHAPE.test(id.replace(/^@+/, ""))) t = "@" + id.replace(/^@+/, "");
+        if (t) return normalizeMentionToken(t);
+        return id ? normalizeMentionToken("@" + id.replace(/^@+/, "")) : "";
       }
     });
     return _td;
   }
 
+  var TOKEN_SHAPE = /^(\{\{[\s\S]*\}\}|\(\([\s\S]*\)\)|\|\|[\s\S]*\|\|)$/;
+  // A chip damaged by an older 2-field import carries its token wrapped in extra
+  // {{ }}: "@{{{{||send_payment_link||}}}}", "@{{{{((greetings.date))}}}}",
+  // "@{{{{callee_name}}}}". Peel the extra wraps: "@||send_payment_link||",
+  // "@((greetings.date))", "@{{callee_name}}". Any other token is returned as is.
+  function normalizeMentionToken(tok) {
+    var s = String(tok == null ? "" : tok);
+    var m = s.match(/^(@+)\{\{(?=\{\{|\(\(|\|\|)/);
+    if (!m) return s;
+    var lead = m[1], core = s.slice(lead.length), w;
+    while ((w = core.match(/^\{\{([\s\S]*)\}\}$/)) && TOKEN_SHAPE.test(w[1])) core = w[1];
+    return lead + core;
+  }
+
+  // Turndown escapes every "_" in plain text, so a reference kept as plain text
+  // (the 2-field dashboard has no chip for @((…)) / @||…||) would export as
+  // "@||send\_payment\_link||". An underscore between two word characters is
+  // never emphasis in GFM, so the escape is dropped inside such tokens.
+  function unescapeTokenUnderscores(md) {
+    // (in a table cell the pipes come out escaped: "@\|\|send\_payment\_link\|\|")
+    return String(md).replace(/@(?:\{\{[^{}\n]+\}\}|\(\([^()\n]+\)\)|\|\|[^|\n]+\|\||\\\|\\\|[^|\n]+?\\\|\\\|)/g, function (tok) {
+      return tok.replace(/([A-Za-z0-9])\\_(?=[A-Za-z0-9])/g, "$1_");
+    });
+  }
+
+  // Is this string real editor HTML (copied text/html, innerHTML, an API value
+  // stored as HTML)? Only a real block tag or a mention chip counts: plain text
+  // or markdown that merely CONTAINS something tag-like ("<END_CALL>",
+  // '<break time="1s"/>') is prompt text and must pass through unchanged —
+  // running it through Turndown would drop the "tag" and flatten the lines.
+  var HTML_BLOCK_RE = /<(?:p|h[1-6]|ul|ol|li|div|br|table|thead|tbody|tr|td|th|pre|blockquote|hr)\b[^<>]*>/i;
+  var HTML_MENTION_RE = /<span\b[^<>]*\b(?:data-type\s*=\s*["']?mention|class\s*=\s*["'][^"']*\bmention|data-id\s*=)[^<>]*>/i;
   function looksLikeHtml(s) {
-    return typeof s === "string" && /<[a-z!/][^>]*>/i.test(s);
+    return typeof s === "string" && (HTML_BLOCK_RE.test(s) || HTML_MENTION_RE.test(s));
   }
 
-  // Build the "@{{token}}" form for a mention node from its data attributes.
-  function mentionToken(node) {
-    var id = (node.getAttribute("data-id") || node.getAttribute("data-label") || "").trim();
-    if (!id) {
-      var t = (node.textContent || "").trim();
-      if (/\{\{[^}]+\}\}/.test(t)) id = t; else return "";
-    }
-    id = id.replace(/^@+/, "");
-    if (!/\{\{[\s\S]*\}\}/.test(id)) id = "{{" + id + "}}";
-    return "@" + id;
-  }
-
-  // Same, for the raw-HTML string fallback path (Turndown unavailable).
-  function mentionTokenFromAttrs(idAttr, labelAttr) {
-    var id = (idAttr || labelAttr || "").trim().replace(/^@+/, "");
-    if (!id) return "";
-    if (!/\{\{[\s\S]*\}\}/.test(id)) id = "{{" + id + "}}";
-    return "@" + id;
+  // Turndown's text escaping, plus:
+  //  - "<" that starts something tag-like ("<END_CALL>", "<!-- x -->", "</b>",
+  //    "<?x") is escaped as "\<" (a CommonMark escape), so literal angle-bracket
+  //    text in a prompt is read back as text, never as HTML, on re-import;
+  //  - an underscore BETWEEN two letters/digits ("snake_case") is never
+  //    emphasis in GFM, so its "\_" escape is dropped (keeps exports readable).
+  // Only text nodes go through here — code spans / blocks stay verbatim.
+  var INTRAWORD_US_RE = (function () {
+    try { return new RegExp("([\\p{L}\\p{M}\\p{N}])\\\\_(?=[\\p{L}\\p{M}\\p{N}])", "gu"); }
+    catch (e) { return /([A-Za-z0-9])\\_(?=[A-Za-z0-9])/g; }
+  })();
+  function ppEscape(base) {
+    return function (string) {
+      var out = base.call(this, string);
+      out = out.replace(/<(?=[A-Za-z\/!?])/g, "\\<");
+      // A typed "~~" (or "~~~" fence) would come back as strikethrough / code:
+      // escape every tilde of a run of two or more ("\~\~" reads back as "~~").
+      out = out.replace(/~{2,}/g, function (r) { return r.replace(/~/g, "\\~"); });
+      return out.replace(INTRAWORD_US_RE, "$1_");
+    };
   }
 
   // A mention chip normally renders its token as visible text, so Turndown's
@@ -186,25 +309,151 @@
         function (m, tag, attrs, inner, tail) { return "<" + tag + attrs + ">" + inner + tail; });
   }
 
+  // Turndown glues its output together one top-level block at a time, and each
+  // step re-reads the whole string so far — quadratic: a 1 MB prompt took
+  // seconds per conversion. A big document is converted in runs of top-level
+  // blocks instead and the runs joined with a blank line (exactly what
+  // Turndown puts between blocks). A run never ends between two lists of the
+  // same kind (their separator needs both) or next to inline content.
+  var CHUNK_BLOCKS = { P: 1, H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1, UL: 1, OL: 1, TABLE: 1, PRE: 1, BLOCKQUOTE: 1, DIV: 1, HR: 1 };
+  // One top-level list with thousands of items, or one paragraph with thousands
+  // of inline nodes, is quadratic inside Turndown too. Such a block is converted
+  // in runs and the runs joined exactly as Turndown would have joined them.
+  // Returns null for an ordinary block.
+  var BIG_RUN = 500, SPLIT_MARK = "\uE000ppsplit\uE000";
+  function bigBlock(td, doc, node) {
+    var kids = node.childNodes, i;
+    if ((node.nodeName === "UL" || node.nodeName === "OL") && node.children.length > 2 * BIG_RUN) {
+      for (i = 0; i < kids.length; i++) {
+        if (kids[i].nodeType === 1 ? kids[i].nodeName !== "LI" : (kids[i].nodeType === 3 && /\S/.test(kids[i].nodeValue))) return null;
+      }
+      var items = Array.prototype.slice.call(node.children);
+      if (node.parentNode) node.parentNode.removeChild(node);   // detached first: moving its items is much cheaper
+      var start = node.getAttribute("start"), first = start ? Number(start) : 1;
+      var md = "";
+      for (var at = 0; at < items.length; at += BIG_RUN) {
+        var list = node.cloneNode(false);
+        if (at && node.nodeName === "OL") list.setAttribute("start", String(first + at));
+        items.slice(at, at + BIG_RUN).forEach(function (li) { list.appendChild(li); });   // moved: the caller drops the node
+        var more = at + BIG_RUN < items.length;
+        // A marker item after the run gives the run's last item its real
+        // spacing to the next one; the marker line is then cut off.
+        if (more) { var mk = doc.createElement("li"); mk.textContent = SPLIT_MARK; list.appendChild(mk); }
+        var wrap = doc.createElement("div"); wrap.appendChild(list);
+        var part = td.turndown(wrap);
+        if (more) {
+          var mi = part.lastIndexOf(SPLIT_MARK);
+          part = mi < 0 ? part + "\n" : part.substring(0, part.lastIndexOf("\n", mi) + 1);
+        }
+        md += part;
+      }
+      return md;
+    }
+    if (node.nodeName === "P" && kids.length > 2 * BIG_RUN) {
+      // Split only at a space between two words / inline elements, so the runs
+      // join with one " " exactly where the paragraph had collapsed whitespace.
+      var cuts = [], count = 0;
+      var nodes = Array.prototype.slice.call(kids);
+      var inl = function (x) { return !x || x.nodeType !== 1 || !/^(BR|IMG)$/.test(x.nodeName); };
+      for (i = 0; i < nodes.length; i++) {
+        var c = nodes[i], m;
+        if (count >= BIG_RUN && c.nodeType === 3 && (m = /\s+/.exec(c.nodeValue))) {
+          var left = c.nodeValue.slice(0, m.index), right = c.nodeValue.slice(m.index + m[0].length);
+          var prev = left ? left : (nodes[i - 1] ? nodes[i - 1].textContent : "");
+          var next = right ? right : (nodes[i + 1] ? nodes[i + 1].textContent : "");
+          if (/\S$/.test(prev) && /^\S/.test(next) && (left || inl(nodes[i - 1])) && (right || inl(nodes[i + 1]))) {
+            cuts.push({ at: i, left: left, right: right }); count = right ? 1 : 0;
+            continue;
+          }
+        }
+        count++;
+      }
+      if (!cuts.length) return null;
+      // (nodes are moved from here on: the caller drops the node)
+      if (node.parentNode) node.parentNode.removeChild(node);   // detached first: moving its children is much cheaper
+      var runs = [], cur = node.cloneNode(false), ci = 0;
+      for (i = 0; i < nodes.length; i++) {
+        var cut = cuts[ci];
+        if (cut && cut.at === i) {
+          if (cut.left) cur.appendChild(doc.createTextNode(cut.left));
+          runs.push(cur); cur = node.cloneNode(false); ci++;
+          if (cut.right) cur.appendChild(doc.createTextNode(cut.right));
+          continue;
+        }
+        cur.appendChild(nodes[i]);
+      }
+      runs.push(cur);
+      return runs.map(function (p) { var w = doc.createElement("div"); w.appendChild(p); return td.turndown(w); })
+        .filter(function (x) { return x; }).join(" ");
+    }
+    return null;
+  }
+  function turndownChunked(td, html) {
+    if (html.length < 60000 || typeof DOMParser === "undefined") return td.turndown(html);
+    var doc = new DOMParser().parseFromString("<div id='__pp_root'>" + html + "</div>", "text/html");
+    var root = doc.getElementById("__pp_root");
+    if (!root) return td.turndown(html);
+    var out = [], chunk = doc.createElement("div"), n = 0, lastEl = null, sepNext = "";
+    function flush() {
+      if (!chunk.firstChild) return;
+      var md = td.turndown(chunk);
+      if (md) out.push(sepNext + md);
+      sepNext = "";
+      chunk = doc.createElement("div"); n = 0;
+    }
+    while (root.firstChild) {
+      var node = root.firstChild;
+      // One huge list / paragraph is itself converted in runs (see bigBlock).
+      var big = node.nodeType === 1 ? bigBlock(td, doc, node) : null;
+      if (big !== null) {
+        // Two lists of the same kind in a row keep their separator.
+        var sameKind = lastEl && (node.nodeName === "UL" || node.nodeName === "OL") && lastEl.nodeName === node.nodeName;
+        flush(); sepNext = "";
+        if (node.parentNode === root) root.removeChild(node);
+        if (big) out.push((sameKind ? "<!-- -->\n\n" : "") + big);
+        lastEl = node;
+        // the next same-kind list (after blank text only) needs the separator too
+        var nx = root.firstChild;
+        while (nx && nx.nodeType === 3 && !/\S/.test(nx.nodeValue)) nx = nx.nextSibling;
+        if (nx && (node.nodeName === "UL" || node.nodeName === "OL") && nx.nodeName === node.nodeName) sepNext = "<!-- -->\n\n";
+        continue;
+      }
+      if (node.nodeType === 1 && n >= 200 && lastEl && CHUNK_BLOCKS[node.nodeName] && CHUNK_BLOCKS[lastEl.nodeName] &&
+          !((node.nodeName === "UL" || node.nodeName === "OL") && node.nodeName === lastEl.nodeName)) flush();
+      chunk.appendChild(node);
+      n++;
+      if (node.nodeType === 1) lastEl = node;
+      else if (node.nodeType === 3 && /\S/.test(node.nodeValue)) lastEl = null;   // inline text: no split right after it
+    }
+    flush();
+    return out.join("\n\n");
+  }
+
   // Convert a stored field value to clean markdown. HTML is run through
   // Turndown; plain text / already-markdown is passed through untouched.
-  function toMarkdown(val) {
+  // opts.html: the value IS HTML (copied text/html, an editor's innerHTML) —
+  // convert it even without a block tag. opts.text: the value is plain text /
+  // markdown (a textarea value, a text/plain copy) — never parse it as HTML.
+  // Without either, only a string with a real block tag / chip is HTML.
+  function toMarkdown(val, opts) {
     if (val == null) return "";
     if (typeof val !== "string") return String(val);
     var s = val;
-    if (looksLikeHtml(s)) {
+    var isHtml = opts && opts.text ? false : (opts && opts.html ? true : looksLikeHtml(s));
+    if (isHtml) {
       s = fillEmptyMentions(s);
       s = tidyEditorHtml(s);
       var td = turndown();
       if (td) {
         try {
-          var md = td.turndown(s);
+          var md = turndownChunked(td, s);
           // Normalize Turndown's padded list markers ("-   x" -> "- x",
           // "1.  x" -> "1. x") while preserving any leading indentation.
           md = md.replace(/^([ \t]*[-*+])[ \t]{2,}/gm, "$1 ")
                  .replace(/^([ \t]*\d+\.)[ \t]{2,}/gm, "$1 ")
                  // a blank line inside a list item comes out as "    " — make it truly blank
                  .replace(/^[ \t]+$/gm, "");
+          md = unescapeTokenUnderscores(md);
           return md.trim();
         } catch (e) { /* fall through */ }
       }
@@ -331,6 +580,8 @@
     return (host.innerText || host.textContent || "").trim();
   }
 
+  function isField(el) { return !!el && (el.tagName === "TEXTAREA" || el.tagName === "INPUT"); }
+
   // The element's OWN text (direct text nodes only), so a big wrapper div whose
   // text happens to contain the label doesn't get treated as the label.
   function ownText(el) {
@@ -403,7 +654,7 @@
         var target = document.getElementById(labelEl.htmlFor);
         if (isEditable(target) && claimed.indexOf(target) === -1) {
           var vt = visibleText(target);
-          if (vt) { out[sec.key] = { text: vt, source: "dom" }; claimed.push(target); return; }
+          if (vt) { out[sec.key] = { text: vt, source: "dom", plain: isField(target) }; claimed.push(target); return; }
         }
       }
 
@@ -421,7 +672,7 @@
       }
       if (best) {
         var t2 = visibleText(best);
-        if (t2) { out[sec.key] = { text: t2, source: "dom" }; claimed.push(best); return; }
+        if (t2) { out[sec.key] = { text: t2, source: "dom", plain: isField(best) }; claimed.push(best); return; }
         // even if empty, claim it so the next section doesn't grab it
         claimed.push(best);
         out[sec.key] = { text: "", source: "dom" };
@@ -689,7 +940,8 @@
     return SECTIONS.map(function (sec) {
       var pick = api[sec.key] || dom[sec.key] || { text: "", source: "none" };
       // Convert the raw field value (HTML from a rich editor / API) to markdown.
-      var body = toMarkdown(pick.text || "").trim();
+      // (a textarea / input value is plain text — never parsed as HTML)
+      var body = toMarkdown(pick.text || "", pick.plain ? { text: true } : null).trim();
 
       // Safety net (fallback path only): blank a section only if its content is
       // IDENTICAL to another section's — using the FULL normalized text, so two
@@ -721,6 +973,7 @@
     combine: combine,
     sectionEditors: sectionEditors,
     expandCollapsed: expandCollapsed,
-    toMarkdown: toMarkdown
+    toMarkdown: toMarkdown,
+    normalizeMentionToken: normalizeMentionToken
   };
 })();

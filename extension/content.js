@@ -19,49 +19,158 @@
   var opGen = 0;              // bumped each openPanel/refresh; stale chains bail
   var opLock = Promise.resolve(); // serialize collect/copy ops (no concurrent copy listeners)
   function runExclusive(fn) {
-    var p = opLock.then(function () { return fn(); });
+    var p = opLock.then(function () {
+      var keep = focusKeeper();
+      return Promise.resolve(fn()).then(function (v) { keep(); return v; }, function (e) { keep(); throw e; });
+    });
     opLock = p.catch(function () {});
     return p;
   }
 
-  var lastUrl = location.href;
+  // ---- busy lock: one page-driving job at a time ----------------------------
+  // kind: "migrate" (Magic Port import), "export" (reads / the Magic Port tour),
+  // "import", "replace". ppLock(kind) → true when taken (re-entrant for the
+  // same kind, so a job's inner steps can take it again), false while another
+  // kind holds it. Every ppLock that returned true needs one ppUnlock(kind).
+  var _ppBusy = null;   // { kind, n }
+  function ppBusy() { return _ppBusy ? _ppBusy.kind : null; }
+  function ppLock(kind) {
+    kind = String(kind || "busy");
+    if (_ppBusy && _ppBusy.kind !== kind) return false;
+    if (_ppBusy) _ppBusy.n++; else _ppBusy = { kind: kind, n: 1 };
+    ppPaintBusy();
+    return true;
+  }
+  function ppUnlock(kind) {
+    if (!_ppBusy || (kind && _ppBusy.kind !== String(kind))) return;
+    if (--_ppBusy.n <= 0) _ppBusy = null;
+    ppPaintBusy();
+  }
+  function ppBusyText() {
+    var k = ppBusy();
+    return k === "migrate" ? "A Magic Port migration is running — wait for it to finish."
+      : k === "export" ? "PromptPort is reading this bot — wait for it to finish."
+      : k === "import" ? "An import is writing to this page — wait for it to finish."
+      : k === "replace" ? "Replace is writing to this page — wait for it to finish."
+      : "PromptPort is busy — wait for the current job to finish.";
+  }
+  // While busy, the controls that would start another job look and act disabled:
+  // the export tiles, Refresh preview, the import drop zone, Replace all, Undo import.
+  function ppBusyTarget(b) {
+    if (!b || !b.matches) return false;
+    if (b.matches(".rs-cta,.rs-dropzone")) return true;
+    var t = String(b.textContent || "").replace(/\s+/g, " ").trim();
+    return /^(Replace all|Undo import|Undo anyway|↻ Refresh preview)$/.test(t);
+  }
+  function ppPaintBusy() {
+    try {
+      if (typeof UI === "undefined" || !UI || !UI.root) return;
+      var on = !!_ppBusy;
+      [].slice.call(UI.root.querySelectorAll("button")).forEach(function (b) {
+        var marked = b.hasAttribute("data-pp-busy");
+        if (on && !marked && ppBusyTarget(b)) {
+          // A focused control is only aria-disabled (the click blocker still
+          // stops it): disabling it would drop keyboard focus to the page.
+          var focused = UI.root.activeElement === b;
+          b.setAttribute("data-pp-busy", b.disabled ? "d" : (focused ? "a" : ""));
+          if (focused) b.setAttribute("aria-disabled", "true"); else b.disabled = true;
+          b.classList.add("rs-busy-off");
+        } else if (!on && marked) {
+          // Re-enable only what the lock disabled; a control its own screen
+          // disabled stays as that screen left it.
+          var how = b.getAttribute("data-pp-busy");
+          if (how === "") b.disabled = false;
+          else if (how === "a") b.removeAttribute("aria-disabled");
+          b.removeAttribute("data-pp-busy");
+          b.classList.remove("rs-busy-off");
+        }
+      });
+    } catch (e) {}
+  }
+
+  // 2-field dashboard: the bot's gateway API responses, newest per URL, as
+  // kept by interceptor.js (it answers "request-latest" with all of them).
+  var gwStore = [];           // [{ url, data }] oldest first
+  var gwWaiters = [];         // resolvers waiting for the next gateway answer
+
+  // The page key that identifies "this bot". On the 2-field dashboard the
+  // ?tab= part changes as tabs are opened (the export tour does that), so only
+  // the path counts there; elsewhere the full address, as before.
+  function navKey() {
+    try { if (isTwoField()) return location.pathname; } catch (e) {}
+    return location.href;
+  }
+  var lastUrl = navKey();
   // In the SPA, drop captured payloads when the assistant page changes, so one
   // assistant's data can never leak into another's export.
   function resetIfNavigated() {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      captured = [];
-      capturedMeta = [];
-      latestAssistant = null;
+    var k = navKey();
+    if (k !== lastUrl) {
+      lastUrl = k;
+      // Keep only what belongs to the bot now on the page (tagged by interceptor.js).
+      capturedMeta = capturedMeta.filter(captureBelongsHere);
+      captured = capturedMeta.map(function (m) { return m.data; });
+      if (!(latestAssistant && captureBelongsHere(latestAssistant))) latestAssistant = null;
+      gwStore = [];
     }
   }
 
-  function addCapture(data, url) {
-    if (!data || typeof data !== "object") return;
-    if (captured.indexOf(data) === -1) {
-      captured.push(data);
-      capturedMeta.push({ url: url || "", data: data });
-    }
+  // interceptor.js tags every capture with the page it was taken on (key: the
+  // bot id in the address, else the path) and the bot id its own request
+  // address names (urlBot). A capture belongs to this page when that bot is this
+  // page's bot — or, with no bot in its address, when it was taken on this page.
+  // Untagged data is never used.
+  function pageKeyNow() { var b = pageBotId(); return b ? "bot:" + b : "path:" + String(location.pathname || ""); }
+  function captureBelongsHere(c) {
+    if (!c || typeof c !== "object" || typeof c.key !== "string") return false;
+    var bot = pageBotId();
+    if (c.urlBot) return !!bot && String(c.urlBot).toLowerCase() === bot;
+    return c.key === pageKeyNow();
+  }
+
+  function addCapture(c) {
+    if (!c || !c.data || typeof c.data !== "object" || !captureBelongsHere(c)) return;
+    var id = String(c.url || "") + "\n" + (c.at || "") + "\n" + c.key;
+    if (c.at && capturedMeta.some(function (m) { return m.id === id; })) return;   // the same response again
+    captured.push(c.data);
+    capturedMeta.push({ url: String(c.url || ""), data: c.data, key: c.key, urlBot: c.urlBot || "", at: c.at || 0, id: id });
     if (captured.length > 40) captured.shift();
     if (capturedMeta.length > 40) capturedMeta.shift();
   }
 
   // ---- talk to the page-world interceptor ---------------------------------
-  window.addEventListener("message", function (ev) {
-    if (ev.source !== window) return;
-    var msg = ev.data;
+  // Only over the private channel set up by bridge.js (a detached element the
+  // page can't reach); window messages are never read, so a page script can't
+  // feed data into an export.
+  var _bridge = window.__ppBridge || null;
+  var _bridgeSeen = {};
+  function onBridge(msg) {
     if (!msg || msg.__ns !== NS) return;
+    _bridgeSeen[msg.type] = (_bridgeSeen[msg.type] || 0) + 1;
+    resetIfNavigated();
+    var p = msg.payload || {};
     if (msg.type === "assistant-data") {
-      latestAssistant = msg.payload;
-      addCapture(msg.payload && msg.payload.data, msg.payload && msg.payload.url);
+      if (!captureBelongsHere(p) || !p.data || typeof p.data !== "object") return;
+      latestAssistant = { url: p.url, data: p.data, key: p.key, urlBot: p.urlBot || "" };
+      addCapture(p);
     } else if (msg.type === "captures") {
-      var list = (msg.payload && msg.payload.list) || [];
-      list.forEach(function (c) { addCapture(c && c.data, c && c.url); });
+      var list = Array.isArray(p.list) ? p.list : [];
+      if (p.gateway) {
+        // The interceptor sends the complete keyed set each time: replace.
+        var forBot = String(p.botId || "").toLowerCase() === pageBotId();
+        gwStore = !forBot ? [] : list.filter(function (c) { return c && c.data && typeof c.data === "object" && captureBelongsHere(c); })
+          .map(function (c) { return { url: String(c.url || ""), data: c.data }; });
+        var w = gwWaiters; gwWaiters = [];
+        w.forEach(function (fn) { try { fn(true); } catch (e) {} });
+        return;
+      }
+      list.forEach(addCapture);
     }
-  });
+  }
+  try { if (_bridge && typeof _bridge.listen === "function") _bridge.listen(onBridge); } catch (e) {}
 
   function askInterceptorForLatest() {
-    window.postMessage({ __ns: NS, type: "request-latest" }, "*");
+    try { if (_bridge && typeof _bridge.send === "function") _bridge.send({ __ns: NS, type: "request-latest" }); } catch (e) {}
   }
 
   // ---- helpers ------------------------------------------------------------
@@ -111,13 +220,21 @@
     // 2-field dashboard: the name is the value of the input under the
     // floating "Agent Name" label.
     if (isTwoField()) {
+      // New layout: <label for="workbench-agent-name">Agent name</label><input id=…>.
+      try {
+        var wn = document.getElementById("workbench-agent-name");
+        var wv = wn ? clean(wn.value) : "";
+        if (wv) return wv;
+      } catch (e) {}
       try {
         var lab = [].slice.call(document.querySelectorAll("label")).filter(function (l) {
           return clean(l.textContent) === "Agent Name";
         })[0];
         var q = lab && lab.parentElement, inp = null;
         for (var d = 0; d < 5 && q && !inp; d++) { inp = q.querySelector("input"); q = q.parentElement; }
-        if (!inp) inp = document.querySelector('input[type="text"]');
+        // New UI: the first text input is often a section field (e.g. a
+        // variable's "Branch Name"), never the agent name — skip the guess.
+        if (!inp && !d2NewUi()) inp = document.querySelector('input[type="text"]');
         var v = inp ? clean(inp.value) : "";
         if (v) return v;
       } catch (e) {}
@@ -214,11 +331,19 @@
   }
 
   // Keep the name human-readable; only strip characters filesystems disallow.
+  // Also: no control characters, no ".." runs, no leading/trailing dots or
+  // spaces (Windows drops a trailing dot → "Bot v2..zip"; a leading dot hides
+  // the file), at most 120 characters before the suffix, never empty.
   function fileBase(name) {
-    return String(name || "")
+    var s = String(name || "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
       .replace(/[\/\\:*?"<>|]/g, " ")
+      .replace(/\.{2,}/g, ".")
       .replace(/\s+/g, " ")
-      .trim() || "assistant";
+      .replace(/^[. ]+|[. ]+$/g, "");
+    var cps = Array.from(s);
+    if (cps.length > 120) s = cps.slice(0, 120).join("").replace(/[. ]+$/, "");
+    return s || "assistant";
   }
 
   function zipFilename() {
@@ -270,9 +395,23 @@
         try { document.removeEventListener("copy", onCopy, false); } catch (e) {}
         // Leave the editor unselected AND unfocused: select-all was only for the
         // copy; a focused, fully-selected editor would be wiped by the next key.
-        try { window.getSelection().removeAllRanges(); } catch (e) {}
-        try { if (el.blur) el.blur(); } catch (e) {}
-        resolve(result);
+        // The editor keeps its own copy of the selection (and shows its
+        // formatting toolbar while text is selected), so first collapse the
+        // selection to the start — the editor picks that up on
+        // "selectionchange" — then drop it and blur.
+        var isRichEl = !(el.tagName === "TEXTAREA" || el.tagName === "INPUT");
+        try {
+          if (isRichEl && el.isConnected) {
+            var r = document.createRange(); r.setStart(el, 0); r.collapse(true);
+            var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+            try { document.dispatchEvent(new Event("selectionchange")); } catch (e) {}
+          }
+        } catch (e) {}
+        setTimeout(function () {
+          try { window.getSelection().removeAllRanges(); } catch (e) {}
+          try { if (el.blur) el.blur(); } catch (e) {}
+          resolve(result);
+        }, isRichEl ? 60 : 0);
       }
 
       // 1) Preferred: ask the editor to serialize itself into a PRIVATE
@@ -334,6 +473,35 @@
   // captured API/embedded data, then to plain DOM text.
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
+  // Captured API data used ONLY when a bucket's editor isn't on the page at
+  // all. Never another bot's data: when the page names its bot, keep only the
+  // captures that mention that bot id.
+  function exportFallbackSections() {
+    resetIfNavigated();
+    var input = captured.length ? captured
+              : (latestAssistant && latestAssistant.data ? [latestAssistant.data] : []);
+    var id = "";
+    try { id = typeof pageBotId === "function" ? pageBotId() : ""; } catch (e) { id = ""; }
+    if (id) {
+      input = input.filter(function (c) {
+        try { return JSON.stringify(c).toLowerCase().indexOf(id) !== -1; } catch (e) { return false; }
+      });
+    }
+    return window.PPExtract.combine(input);
+  }
+
+  // Markdown of the last copied HTML per bucket: refreshExport reads the page
+  // more than once, and converting an unchanged (possibly 1 MB) bucket again
+  // is the slow part — so an identical copy reuses its markdown.
+  var _mdMemo = {};
+  function memoMarkdown(key, val, opts) {
+    var k = (opts && opts.text ? "t:" : "h:") + key, hit = _mdMemo[k];
+    if (hit && hit.src === val) return hit.md;
+    var md = window.PPExtract.toMarkdown(val, opts);
+    _mdMemo[k] = { src: val, md: md };
+    return md;
+  }
+
   async function collectSections() {
     // 2-field dashboard has just two fields — read them directly. Never run
     // Dash5's expand-collapsed logic here (it clicks toggles near headings).
@@ -348,9 +516,11 @@
       }
     } catch (e) {}
 
-    var baseline = buildSections();            // API / DOM fallback
     var map;
     try { map = window.PPExtract.sectionEditors(); } catch (e) { map = []; }
+    // API / DOM fallback — built only when some bucket has NO editor on the page.
+    var baseline = null;
+    function fallback() { if (!baseline) baseline = exportFallbackSections(); return baseline; }
 
     var prevText = "";
     try { prevText = await navigator.clipboard.readText(); } catch (e) {}
@@ -358,12 +528,15 @@
     var results = [];
     for (var i = 0; i < map.length; i++) {
       var m = map[i];
-      var base = baseline[i] || { text: "", source: "none" };
-      var md = "", source = base.source;
+      var md = "", source = "none";
       var el = m.el;
       if (el) {
+        // The editor is on the page: what it shows is the truth. An EMPTY editor
+        // exports as empty (the user cleared it) — never as captured API text,
+        // which may be stale or another bot's.
         if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-          md = window.PPExtract.toMarkdown(el.value || "");
+          // a field's value is plain text / markdown, never HTML
+          md = memoMarkdown(m.key, el.value || "", { text: true });
           if (md) source = "ui";
         } else {
           var cap = await copyEditor(el);
@@ -372,16 +545,19 @@
             console.log("  html:", (cap.html || "(none)").slice(0, 400));
             console.log("  text:", (cap.text || "(none)").slice(0, 400));
           } catch (e) {}
-          if (cap.html) { md = window.PPExtract.toMarkdown(cap.html); source = "ui"; }
-          else if (cap.text) { md = window.PPExtract.toMarkdown(cap.text); source = "ui"; }
+          if (cap.html) { md = memoMarkdown(m.key, cap.html, { html: true }); source = "ui"; }
+          else if (cap.text) { md = memoMarkdown(m.key, cap.text, { text: true }); source = "ui"; }
         }
+        if (!md) source = "none";
+      } else {
+        var base = fallback()[i] || { text: "", source: "none" };
+        md = (base.text || "").trim(); source = md ? base.source : "none";
       }
-      if (!md) { md = (base.text || "").trim(); source = md ? base.source : "none"; }
       results.push({ key: m.key, title: m.title, filename: m.filename, text: md, source: source });
     }
 
     try { if (prevText) await navigator.clipboard.writeText(prevText); } catch (e) {}
-    return results.length ? results : baseline;
+    return results.length ? results : fallback();
   }
 
   function sectionsToFiles(sections) {
@@ -437,9 +613,36 @@
     MAIN_SPLIT_KEYS.forEach(function (key) {
       var t = partsByKey && partsByKey[key];
       if (!meaningful(t)) return;                                  // skip empty → no dangling heading
-      out.push("# " + bucketHeading(key) + "\n\n" + String(t).trim()); // H1 above each bucket
+      out.push("# " + bucketHeading(key) + "\n\n" + innerBucketH1s(String(t).trim())); // H1 above each bucket
     });
     return out.join("\n\n");
+  }
+
+  // A bucket's OWN "# Conversation Flow"-style H1 (a heading that names a
+  // bucket) would be read back as a split point and move text into another
+  // bucket. Write such an H1 in the equivalent setext form ("Title" + "===")
+  // — still an H1 when pasted / rendered, but never a split point;
+  // splitMainPrompt turns it back into "# Title", so 5 → 2 → 5 is lossless.
+  var INNER_H1_GAP = " ";
+  function innerBucketH1s(md) {
+    var lines = String(md).split("\n"), inFence = fenceTracker();
+    for (var i = 0; i < lines.length; i++) {
+      if (inFence(lines[i])) continue;
+      var m = lines[i].match(ATX_H1_RE);
+      if (!m || !canonicalSection(headingTitle(m[1]))) continue;
+      var title = m[1];
+      // a title that would read as a list item / quote / fence: escape its first
+      // marker (one more backslash; restoreInnerH1s removes exactly one)
+      if (/^\\*([-*+>#=]|`{3}|~{3})/.test(title)) title = "\\" + title;
+      else if (/^\d+\\*[.)]/.test(title)) title = title.replace(/^(\d+)/, "$1\\");
+      // a setext heading must not continue the paragraph above it: separate it
+      // with a whitespace-only line (INNER_H1_GAP) that restoreInnerH1s drops
+      // again — added also when the line above already is one, so a user's own
+      // whitespace-only line survives.
+      var gap = i > 0 && (/\S/.test(lines[i - 1]) || lines[i - 1] === INNER_H1_GAP);
+      lines[i] = (gap ? INNER_H1_GAP + "\n" : "") + title + "\n" + new Array(Math.max(3, Math.min(title.length, 80)) + 1).join("=");
+    }
+    return lines.join("\n");
   }
 
   function sectionsToTwoFiles(sections) {
@@ -516,19 +719,363 @@
       captures: captures,
       captureMeta: capturedMeta,   // url-tagged, for assistant-level tool filtering
       promptFiles: promptFiles,
-      pluginVersion: "4.0.0"
+      botId: pageBotId(),          // only this bot's data (never a previous page's)
+      pluginVersion: PP_VERSION
     });
     if (!built || !built.ok) return { ok: false, reason: (built && built.reason) || "no source data" };
     return { ok: true, files: window.MagicPort.buildZipFiles(built.config, promptFiles), config: built.config };
   }
   function downloadMagicPort(sections) {
     var r = buildMagicPortFiles(sections);
-    if (!r || !r.ok) { toast("Magic Port: " + ((r && r.reason) || "couldn't read this bot") + " — reload the bot and try again."); return false; }
-    var fname = fileBase(nameFromUI() || assistantName()) + " (Magic Port).zip";
+    if (!r || !r.ok) { toast(mpFailText((r && r.reason) || "couldn't read this bot")); return false; }
+    var fname = mpZipName();
     saveZip(r.files, fname);
     var n = (r.config.data.variables || []).length;
     toast("Magic Port ZIP downloaded — " + n + " variables + configs" +
       (r.config.containsCredentials ? " (contains credentials)" : ""));
+    _lastDl = "Magic Port ZIP downloaded."; setLinks(true);
+    return true;
+  }
+
+  // "Magic Port: <reason> — reload the bot and try again." (a reason that already
+  // says what to do stands alone).
+  function mpFailText(reason) {
+    reason = String(reason || "");
+    return "Magic Port: " + reason + (/reload|try again/i.test(reason) ? "" : " — reload the bot and try again.");
+  }
+  // The Magic Port zip's name: the bot's name (page-controlled) capped so the
+  // whole name stays well under file-system limits.
+  function mpZipName() {
+    var base = fileBase(nameFromUI() || assistantName());
+    var bcp = Array.from(base);   // by code point: never split an emoji / surrogate pair
+    if (bcp.length > 80) base = bcp.slice(0, 80).join("").replace(/[. ]+$/, "").trim() || "assistant";
+    return base + " (Magic Port).zip";
+  }
+
+  // ---- Magic Port export from a 2-field bot --------------------------------
+  // The 2-field app loads each part of the bot (LLM/STT, voices, webhooks,
+  // tools per phase, analysis model) only when its tab is opened, and caches it.
+  // So the export first takes a short READ-ONLY tour of those tabs (it only
+  // switches tabs — never types, toggles or saves), reads the names shown on
+  // screen, then returns to the tab the user was on and builds the file from
+  // the app's own captured responses.
+  var D2_TOP_TABS = ["Prompt", "LLM and STT", "Custom Variables", "Call Config", "Language and Voice",
+    "Event Subscription", "Tools", "Custom Analysis"];
+  var D2_GATEWAY_RE = /\/v1\/(voiceagents\/[0-9a-f-]{36}(\?|$)|tools\/[0-9a-f-]{36}|webhooks\/[0-9a-f-]{36}|webhook-events|providers|provider-models|voiceagents\/compatible-voices|voiceagents\/language-catalog)/i;
+
+  function pageBotId() {
+    var m = location.pathname.match(/\/voice-agents\/([0-9a-f-]{36})(?:[\/?#]|$)/i) ||
+            location.pathname.match(/\/assistants\/([0-9a-f-]{8,})(?:[\/?#]|$)/i);
+    return m ? m[1].toLowerCase() : "";
+  }
+  function d2Norm(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+  function d2Visible(e) {
+    if (!e || !e.isConnected) return false;
+    var r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  // New layout (sidebar of section buttons, see MagicPortDom.v2*): true when it is showing.
+  function d2NewUi() {
+    try { return !!(window.MagicPortDom && window.MagicPortDom.v2IsNewUi && window.MagicPortDom.v2IsNewUi()); } catch (e) { return false; }
+  }
+  // New layout: the Tools section's phase tab (phase = pre_call|on_call|post_call).
+  function d2PhaseTab(phase) { return document.querySelector("[role='tab'][id$='-trigger-" + phase + "']"); }
+  // The top-level tab that is showing now ("" if none can be told).
+  // New layout: the active section's slug ("prompt", "llm-stt", …).
+  function d2CurrentTopTab() {
+    if (d2NewUi()) return window.MagicPortDom.v2ActiveSection() || "";
+    var tabs = [].slice.call(document.querySelectorAll("[role='tab']"));
+    for (var i = 0; i < tabs.length; i++) {
+      var t = d2Norm(tabs[i].textContent);
+      if (D2_TOP_TABS.indexOf(t) !== -1 &&
+          (tabs[i].getAttribute("aria-selected") === "true" || tabs[i].getAttribute("data-state") === "active")) return t;
+    }
+    return "";
+  }
+  var D2_LABEL_SLUG = { "prompt": "prompt", "llm and stt": "llm-stt", "custom variables": "custom-variables",
+    "call config": "call-config", "language and voice": "language-voice", "event subscription": "event-subscription",
+    "tools": "tools", "custom analysis": "custom-analysis" };
+  function d2HasTab(label) {
+    var want = String(label || "").toLowerCase();
+    if (d2NewUi()) {
+      // Phase tabs by id suffix ("Post Call" reads "Post CallSoon"); else a sidebar section by slug.
+      var ph = { "pre call": "pre_call", "on call": "on_call", "post call": "post_call" }[want];
+      if (ph) return !!d2PhaseTab(ph);
+      // A section by its old tab label, its new sidebar label, or its slug.
+      var slug = D2_LABEL_SLUG[want] || want;
+      for (var s in D2_V2_LABEL) if (D2_V2_LABEL[s].toLowerCase() === want) slug = s;
+      return !!window.MagicPortDom.v2SectionButton(slug);
+    }
+    return [].slice.call(document.querySelectorAll("[role='tab']")).some(function (t) {
+      return d2Visible(t) && d2Norm(t.textContent).toLowerCase() === want;
+    });
+  }
+  // Provider/Model pairs on the current tab: role=textbox boxes labelled
+  // "Provider"/"Model", each holding a read-only input with the shown value.
+  // New layout: <label>Provider|Model</label> + button[role=combobox] (labelled
+  // through aria-labelledby / label[for]); placeholders ("Select provider",
+  // "Pick a provider first") read as "". Scoped to the open section's editor.
+  function d2ProviderModelPairs() {
+    if (d2NewUi()) {
+      var MPD = window.MagicPortDom;
+      var scope = document.querySelector('section[aria-label="Models editor"]') ||
+                  document.querySelector('section[aria-label="Post-call analysis editor"]') ||
+                  document.querySelector("main") || document;
+      var out = [], cur2 = null;
+      [].slice.call(scope.querySelectorAll("button[role='combobox']")).forEach(function (b) {
+        var l = d2Norm(MPD.v2LabelOf(b)).toLowerCase().replace(/\s*(\*|\(required\))\s*$/, "");
+        if (l !== "provider" && l !== "model") return;
+        var v = d2Norm(MPD.v2ComboValue(b));
+        if (/^(select provider|pick a provider first|select a model|select model|select|loading.*)$/i.test(v)) v = "";
+        if (l === "provider") { cur2 = { provider: v, model: "" }; out.push(cur2); }
+        else if (cur2 && !cur2.model) { cur2.model = v; cur2 = null; }
+        else out.push({ provider: "", model: v });
+      });
+      return out;
+    }
+    var boxes = [].slice.call(document.querySelectorAll("[role='textbox'][aria-label]")).filter(function (b) {
+      var l = d2Norm(b.getAttribute("aria-label")).toLowerCase();
+      return (l === "provider" || l === "model") && d2Visible(b);
+    });
+    var pairs = [], cur = null;
+    boxes.forEach(function (b) {
+      var l = d2Norm(b.getAttribute("aria-label")).toLowerCase();
+      var inp = b.matches("input") ? b : b.querySelector("input");
+      var v = d2Norm(inp ? inp.value : b.textContent);
+      if (l === "provider") { cur = { provider: v, model: "" }; pairs.push(cur); }
+      else if (cur && !cur.model) { cur.model = v; cur = null; }
+      else pairs.push({ provider: "", model: v });
+    });
+    return pairs;
+  }
+  // The selected voice card on Language and Voice: a role=radio button with
+  // aria-checked=true whose text leaves are name · provider · model (· tone).
+  // The filter chips (All / provider / gender / speed) are radios too, but
+  // have a single text leaf and no avatar.
+  // New layout: <button role=radio data-choice-card data-value=<tts_voice_id>
+  // aria-checked=true aria-label="Name, Provider, model, Gender">; the text
+  // leaves there are name · gender · provider · model · tone, so the aria-label
+  // is read instead (from the right: a name may itself contain ", ").
+  function d2SelectedVoice() {
+    if (d2NewUi()) {
+      var vc = document.querySelector("[role='radio'][data-choice-card][aria-checked='true']");
+      if (!vc) return null;
+      var parts = String(vc.getAttribute("aria-label") || "").split(", ").map(d2Norm);
+      if (parts.length >= 4) return { name: parts.slice(0, parts.length - 3).join(", "), provider: parts[parts.length - 3], model: parts[parts.length - 2] };
+      if (parts.length === 3) return { name: parts[0], provider: parts[1], model: parts[2] };
+      return null;
+    }
+    var cards = [].slice.call(document.querySelectorAll("[role='radio'][aria-checked='true']")).filter(d2Visible);
+    for (var i = 0; i < cards.length; i++) {
+      var leaves = [].slice.call(cards[i].querySelectorAll("*")).filter(function (e) {
+        return !e.children.length && d2Norm(e.textContent);
+      }).map(function (e) { return d2Norm(e.textContent); });
+      if (leaves.length >= 3 || (cards[i].querySelector("img") && leaves.length >= 2))
+        return { name: leaves[0] || "", provider: leaves[1] || "", model: leaves[2] || "" };
+    }
+    return null;
+  }
+  async function d2Poll(fn, ms) {
+    var end = Date.now() + (ms || 2000), v = null;
+    while (true) {
+      try { v = fn(); } catch (e) { v = null; }
+      if (v || Date.now() >= end) return v;
+      await sleep(150);
+    }
+  }
+  // Ask the interceptor for everything it kept; resolve when it answers.
+  function d2AskGateway(ms) {
+    return new Promise(function (res) {
+      var done = false;
+      function fin(v) { if (!done) { done = true; res(v); } }
+      gwWaiters.push(fin);
+      setTimeout(function () { fin(false); }, ms || 2000);
+      askInterceptorForLatest();
+    });
+  }
+
+  // The tour. onStep(label) reports progress. Returns
+  // { ok, uiNames, missed:[labels], returnedTo, sections? }.
+  async function d2Tour(onStep, needPrompt) {
+    if (d2NewUi()) return d2TourV2(onStep, needPrompt);
+    var MPI = window.MagicPortImport;
+    if (!MPI || typeof MPI.gotoTab !== "function") return { ok: false, reason: "this page's tabs can't be opened by the plugin" };
+    var go = function (label, budget) { return MPI.gotoTab(label, { budgetMs: budget || 5000 }); };
+    var start = d2CurrentTopTab();
+    var uiNames = { llm: null, stt: null, analysis: null, voice: null };
+    var missed = [], sections = null;
+    async function visit(label, budget) {
+      if (onStep) onStep(label);
+      var ok = false;
+      try { ok = await go(label, budget); } catch (e) { ok = false; }
+      if (!ok) missed.push(label);
+      return ok;
+    }
+    if (await visit("LLM and STT")) {
+      var pairs = await d2Poll(function () {
+        var p = d2ProviderModelPairs();
+        return (p.length >= 2 && p[0].provider && p[1].provider) ? p : null;
+      }, 2500) || d2ProviderModelPairs();
+      if (pairs[0] && (pairs[0].provider || pairs[0].model)) uiNames.llm = { provider: pairs[0].provider, model: pairs[0].model };
+      if (pairs[1] && (pairs[1].provider || pairs[1].model)) uiNames.stt = { provider: pairs[1].provider, model: pairs[1].model };
+    }
+    if (await visit("Language and Voice")) uiNames.voice = await d2Poll(d2SelectedVoice, 2500);
+    await visit("Event Subscription");
+    if (await visit("Tools")) {
+      await sleep(300);
+      var phases = ["Pre Call", "On call", "Post Call"];
+      for (var i = 0; i < phases.length; i++) {
+        if (!d2HasTab(phases[i])) continue;
+        await visit(phases[i], 3000);
+        await sleep(250);
+      }
+    }
+    if (await visit("Custom Analysis")) {
+      var ap = await d2Poll(function () { var p = d2ProviderModelPairs(); return (p[0] && p[0].provider) ? p : null; }, 1200) || d2ProviderModelPairs();
+      uiNames.analysis = (ap[0] && ap[0].provider) ? { provider: ap[0].provider, model: ap[0].model } : null;
+    }
+    // The prompt fields live on the Prompt tab: read them there if the first
+    // read (on another tab) found nothing.
+    if (needPrompt && await visit("Prompt")) {
+      // The tab is selected before its content mounts: wait for both editors.
+      await d2Poll(function () { var g = twoFieldEditors(); return !!(g.fm && g.mp); }, 6000);
+      try { sections = await runExclusive(collectSections); } catch (e) { sections = null; }
+    }
+    var back = start || "Prompt";
+    if (onStep) onStep("back to " + back);
+    var returned = false;
+    try { returned = await go(back, 6000); } catch (e) { returned = false; }
+    // Let the last responses land before asking for them.
+    await sleep(400);
+    return { ok: true, uiNames: uiNames, missed: missed, returnedTo: returned ? back : "", start: start, sections: sections };
+  }
+
+  // The same read-only tour on the new layout: sidebar sections (by slug, only
+  // the open section is mounted) and the Tools phase tabs (Radix: they switch on
+  // pointerdown/mousedown, a bare click does nothing). Pre Call is visited so the
+  // app loads ?trigger=PRE_CALL. Never types, toggles or saves.
+  var D2_V2_LABEL = { "prompt": "Prompt", "custom-variables": "Variables", "language-voice": "Language & voice",
+    "llm-stt": "Models", "custom-analysis": "Post-call analysis", "call-config": "Call settings",
+    "tools": "Tools", "event-subscription": "Webhooks" };
+  async function d2TourV2(onStep, needPrompt) {
+    var MPD = window.MagicPortDom, S = MPD.V2_SECTIONS;
+    var startSlug = MPD.v2ActiveSection() || "";
+    var uiNames = { llm: null, stt: null, analysis: null, voice: null };
+    var missed = [], sections = null;
+    function ed(label) {
+      // compared by value: "&" in a quoted selector value trips some selector engines
+      return function () { return [].some.call(document.querySelectorAll("section[aria-label]"), function (s) { return s.getAttribute("aria-label") === label; }); };
+    }
+    async function visit(slug, ready, budget) {
+      var label = D2_V2_LABEL[slug] || slug;
+      if (onStep) onStep(label);
+      var ok = false;
+      try { ok = await MPD.v2GotoSection(slug, ready, budget || 8000); } catch (e) { ok = false; }
+      if (!ok) missed.push(label);
+      return ok;
+    }
+    if (await visit(S.llmStt, ed("Models editor"))) {
+      var pairs = await d2Poll(function () {
+        var p = d2ProviderModelPairs();
+        return (p.length >= 2 && p[0].provider && p[1].provider && p[0].model && p[1].model) ? p : null;
+      }, 3000) || d2ProviderModelPairs();
+      if (pairs[0] && (pairs[0].provider || pairs[0].model)) uiNames.llm = { provider: pairs[0].provider, model: pairs[0].model };
+      if (pairs[1] && (pairs[1].provider || pairs[1].model)) uiNames.stt = { provider: pairs[1].provider, model: pairs[1].model };
+    }
+    if (await visit(S.languageVoice, ed("Language & voice editor"))) uiNames.voice = await d2Poll(d2SelectedVoice, 3000);
+    if (await visit(S.events, ed("Webhooks editor"))) await sleep(300);
+    if (await visit(S.tools, ed("Tools editor"))) {
+      await d2Poll(function () { return d2PhaseTab("on_call"); }, 2500);
+      var phases = [["pre_call", "Pre Call"], ["on_call", "On call"], ["post_call", "Post Call"]];
+      for (var i = 0; i < phases.length; i++) {
+        var tab = d2PhaseTab(phases[i][0]);
+        if (!tab) continue;
+        // "Soon" phases (Post Call today) do nothing when pressed: skip them.
+        if (tab.querySelector("[title='Soon']") || /soon$/i.test(d2Norm(tab.textContent))) continue;
+        if (onStep) onStep("Tools → " + phases[i][1]);
+        var on = function () { var t = d2PhaseTab(phases[i][0]); return !!t && (t.getAttribute("aria-selected") === "true" || t.getAttribute("data-state") === "active"); };
+        for (var a = 0; a < 3 && !on(); a++) {
+          MPD.pressSequence(d2PhaseTab(phases[i][0]) || tab);
+          await d2Poll(on, 1200);
+        }
+        if (!on()) missed.push("Tools → " + phases[i][1]);
+        await sleep(350);
+      }
+    }
+    if (await visit(S.analysis, ed("Post-call analysis editor"))) {
+      var ap = await d2Poll(function () { var p = d2ProviderModelPairs(); return (p[0] && p[0].provider) ? p : null; }, 1500) || d2ProviderModelPairs();
+      uiNames.analysis = (ap[0] && ap[0].provider) ? { provider: ap[0].provider, model: ap[0].model } : null;
+    }
+    // The prompt editors are mounted only on the Prompt section.
+    if (needPrompt && await visit(S.prompt, function () { var g = twoFieldEditors(); return !!(g.fm && g.mp); })) {
+      try { sections = await runExclusive(collectSections); } catch (e) { sections = null; }
+    }
+    var backSlug = startSlug || S.prompt, back = D2_V2_LABEL[backSlug] || backSlug;
+    if (onStep) onStep("back to " + back);
+    var returned = false;
+    try { returned = await MPD.v2GotoSection(backSlug, null, 6000); } catch (e) { returned = false; }
+    await sleep(400);
+    return { ok: true, uiNames: uiNames, missed: missed, returnedTo: returned ? back : "",
+      start: startSlug ? back : "", sections: sections };
+  }
+
+  function d2CaptureMeta() {
+    var gwUrls = {};
+    gwStore.forEach(function (c) { gwUrls[c.url] = 1; });
+    // Ring-buffer captures of the same gateway URLs are older copies: the
+    // keyed store's newest copy goes last so it wins.
+    var rest = capturedMeta.filter(function (m) { return !(m && D2_GATEWAY_RE.test(m.url || "") && gwUrls[m.url]); });
+    return rest.concat(gwStore);
+  }
+
+  async function downloadMagicPortDash2(sections, onStep) {
+    if (!window.MagicPort) { toast("Magic Port: couldn't start — reload the page and try again.", null, "info"); return false; }
+    // The tour drives the page's tabs: never while another job (a migration) does.
+    if (!ppLock("export")) { toast(ppBusyText(), null, "info"); return false; }
+    try { return await downloadMagicPortDash2Locked(sections, onStep); }
+    finally { ppUnlock("export"); }
+  }
+  async function downloadMagicPortDash2Locked(sections, onStep) {
+    resetIfNavigated();
+    var hasPrompt = (sections || []).some(function (x) { return x && x.text && x.text.trim(); });
+    var tour;
+    try { tour = await d2Tour(onStep, !hasPrompt); }
+    catch (e) { tour = { ok: false, reason: String((e && e.message) || e) }; }
+    if (!tour.ok) { toast("Magic Port: couldn't read the bot — " + (tour.reason || "the tour failed") + ".", null, "info"); return false; }
+    if (tour.sections && tour.sections.some(function (x) { return x && x.text && x.text.trim(); })) sections = tour.sections;
+    else if (!hasPrompt) {
+      // Never ship a ZIP whose prompt files are only placeholders.
+      toast("Magic Port: couldn't read the prompt — open the Prompt section, wait for it to load, then try again.", null, "info");
+      return false;
+    }
+    if (onStep) onStep("collecting");
+    var answered = await d2AskGateway(2500);
+    resetIfNavigated();
+    var promptFiles = magicPortPromptFiles(sections || []);
+    var built;
+    try {
+      built = window.MagicPort.buildConfig({
+        platform: "dash2",
+        captures: captured.slice(),
+        captureMeta: d2CaptureMeta(),
+        promptFiles: promptFiles,
+        uiNames: tour.uiNames,
+        botId: pageBotId(),
+        pluginVersion: PP_VERSION
+      });
+    } catch (e) { built = { ok: false, reason: "the bot data couldn't be read (" + ((e && e.message) || e) + ")" }; }
+    if (!built || !built.ok) {
+      toast(mpFailText((built && built.reason) || (answered ? "couldn't read this bot" : "no bot data was captured")), null, "info");
+      return false;
+    }
+    var fname = mpZipName();
+    saveZip(window.MagicPort.buildZipFiles(built.config, promptFiles), fname);
+    var n = ((built.config.data || {}).variables || []).length;
+    var msg = "Magic Port ZIP downloaded — " + n + " variables + configs" +
+      (built.config.containsCredentials ? " (contains credentials)" : "");
+    if (tour.missed.length) msg += ". Couldn't open: " + tour.missed.join(", ") + " — check those parts after importing";
+    if (!tour.returnedTo && tour.start) msg += ". Couldn't return to " + tour.start;
+    toast(msg);
     _lastDl = "Magic Port ZIP downloaded."; setLinks(true);
     return true;
   }
@@ -543,7 +1090,9 @@
   }
 
   // The panel's Prompt tab has two TipTap editors, each right after an <h3>
-  // label: "First Message" and "Main Prompt". Fall back to document order.
+  // label: "First Message" and "Main Prompt". No fallback to "the first editors
+  // on the page": on another tab (e.g. Custom Analysis) that would be the wrong
+  // editor, so a missing label means "not found".
   function twoFieldEditors() {
     function own(e) {
       var t = "";
@@ -551,6 +1100,29 @@
         if (e.childNodes[i].nodeType === 3) t += e.childNodes[i].textContent;
       }
       return t.replace(/\s+/g, " ").trim();
+    }
+    // New layout: <section aria-label="Prompt editor"> holds one
+    // <section aria-labelledby> per field, its <h3> reading "First message" /
+    // "Main prompt" (an edited field adds an sr-only "Edited" child, so only the
+    // h3's own text counts). Only that section is searched: Post-call analysis
+    // has a TipTap editor of its own. Off the Prompt section: not found.
+    var proot = document.querySelector('section[aria-label="Prompt editor"]');
+    if (proot || d2NewUi()) {
+      if (!proot) return { fm: null, mp: null };
+      var pe = [].slice.call(proot.querySelectorAll(".ProseMirror"));
+      var heads = [].slice.call(proot.querySelectorAll("h1,h2,h3,h4,h5,label"));
+      var byHead = function (text) {
+        var h = heads.filter(function (e) { return own(e).toLowerCase() === text; })[0];
+        if (!h) return null;
+        var box = h.closest("section[aria-labelledby]");
+        var inBox = box && box !== proot ? box.querySelector(".ProseMirror") : null;
+        if (inBox) return inBox;
+        for (var i = 0; i < pe.length; i++) if (h.compareDocumentPosition(pe[i]) & 4) return pe[i];
+        return null;
+      };
+      var nf = byHead("first message"), nm = byHead("main prompt");
+      if (nf && nm && nf === nm) nf = null;
+      return { fm: nf, mp: nm };
     }
     var eds = [].slice.call(document.querySelectorAll(".ProseMirror"));
     var labels = [].slice.call(document.querySelectorAll("h1,h2,h3,h4,h5,label,span,div,p"));
@@ -564,25 +1136,101 @@
     }
     var fm = editorAfter("First Message");
     var mp = editorAfter("Main Prompt");
-    if (fm && mp && fm === mp) mp = null;
-    if (!fm && eds[0] && eds[0] !== mp) fm = eds[0];
-    if (!mp && eds[1] && eds[1] !== fm) mp = eds[1];
+    if (fm && mp && fm === mp) fm = null;   // the First Message label has no editor of its own
     return { fm: fm, mp: mp };
   }
 
+  // New layout: true when the prompt editors aren't mounted because another
+  // section is open (only the Prompt section mounts them).
+  function d2OffPrompt() {
+    if (!isTwoField() || !d2NewUi()) return false;
+    var MPD = window.MagicPortDom;
+    if (!MPD || !MPD.v2ActiveSection || !MPD.V2_SECTIONS) return false;
+    if (MPD.v2ActiveSection() === MPD.V2_SECTIONS.prompt) return false;
+    var g = twoFieldEditors();
+    return !(g.fm || g.mp);
+  }
+  // New layout: run fn() on the Prompt section, then go back to the section
+  // the user was on. Only switches sections (edits made elsewhere stay pending;
+  // Save / Discard are never pressed) and holds the busy lock (kind) while
+  // away. → { ok, value } or { ok:false, why:"busy"|"noprompt" }.
+  async function d2OnPromptSection(fn, kind) {
+    var MPD = window.MagicPortDom;
+    if (!d2OffPrompt()) return { ok: true, value: await fn() };
+    if (!ppLock(kind)) return { ok: false, why: "busy" };
+    var start = MPD.v2ActiveSection() || "", ready = function () { var g = twoFieldEditors(); return !!(g.fm && g.mp); };
+    var subTabs = d2SelectedSubTabs();   // e.g. Tools → "Pre Call": put back after the round trip
+    try {
+      var went = false;
+      try { went = await MPD.v2GotoSection(MPD.V2_SECTIONS.prompt, ready, 9000); } catch (e) { went = false; }
+      if (!went) return { ok: false, why: "noprompt" };
+      var v = await fn();
+      await sleep(350);   // let the app take in an edit before its editor unmounts
+      return { ok: true, value: v };
+    } finally {
+      if (start && MPD.v2ActiveSection() !== start) {
+        try { await MPD.v2GotoSection(start, null, 6000); } catch (e) {}
+        try { await d2RestoreSubTabs(subTabs); } catch (e) {}
+      }
+      ppUnlock(kind);
+    }
+  }
+  // The inner tabs selected in the open section (Tools: Pre Call / On call …).
+  // A section switch remounts it on its first tab, so a round trip to Prompt
+  // records them first and selects them again on return.
+  function d2SubTabKey(t) {
+    var id = t.id || "", m = /-trigger-(.+)$/.exec(id);
+    return { suffix: m ? m[1] : "", text: (t.textContent || "").replace(/\s+/g, " ").trim() };
+  }
+  function d2SubTabsNow() {
+    var main = document.querySelector("main") || document.body;
+    return [].slice.call(main.querySelectorAll('[role="tab"]')).filter(function (t) {
+      return !t.closest('nav[aria-label="Agent sections"], [role="dialog"], #promptport-host-v41') && t.offsetParent !== null;
+    });
+  }
+  function d2SelectedSubTabs() {
+    try {
+      return d2SubTabsNow().filter(function (t) { return t.getAttribute("aria-selected") === "true"; }).map(d2SubTabKey);
+    } catch (e) { return []; }
+  }
+  async function d2RestoreSubTabs(keys) {
+    if (!keys || !keys.length) return;
+    var MPD = window.MagicPortDom;
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i], tab = null;
+      var find = function () {
+        tab = d2SubTabsNow().filter(function (t) {
+          var c = d2SubTabKey(t);
+          return k.suffix ? c.suffix === k.suffix : (k.text && c.text === k.text);
+        })[0] || null;
+        return !!tab;
+      };
+      var t0 = Date.now();
+      while (!find() && Date.now() - t0 < 3000) await sleep(150);
+      if (!tab || tab.getAttribute("aria-selected") === "true") continue;
+      try { if (MPD && MPD.pressSequence) MPD.pressSequence(tab); else tab.click(); } catch (e) {}
+      await sleep(250);
+    }
+  }
+
   async function collectTwoField() {
+    // New layout, another section open: read on the Prompt section, then come back.
+    if (d2OffPrompt()) { var rp = await d2OnPromptSection(collectTwoFieldHere, "export"); if (rp.ok) return rp.value; }
+    return collectTwoFieldHere();
+  }
+  async function collectTwoFieldHere() {
     var m = twoFieldEditors();
     var prevText = "";
     try { prevText = await navigator.clipboard.readText(); } catch (e) {}
-    async function read(el) {
+    async function read(el, key) {
       if (!el) return "";
       var cap = await copyEditor(el);
-      if (cap.html) return window.PPExtract.toMarkdown(cap.html);
-      if (cap.text) return window.PPExtract.toMarkdown(cap.text);
+      if (cap.html) return memoMarkdown(key, cap.html, { html: true });
+      if (cap.text) return memoMarkdown(key, cap.text, { text: true });
       return "";
     }
-    var fm = await read(m.fm);
-    var mp = await read(m.mp);
+    var fm = await read(m.fm, "first-message");
+    var mp = await read(m.mp, "main-prompt");
     try { if (prevText) await navigator.clipboard.writeText(prevText); } catch (e) {}
     return [
       { key: "first-message", title: "First Message", filename: "First message.md", text: fm, source: fm ? "ui" : "none" },
@@ -624,17 +1272,61 @@
     var n = normName(str);
     return MAIN_NAMES.some(function (x) { return normName(x) === n; });
   }
-  function splitMainPrompt(md) {
-    var lines = String(md || "").replace(/\r\n?/g, "\n").split("\n");
-    var heads = [], inFence = false;
+  // "# Title" (an <h1>). An escaped "\\# Title" is a PARAGRAPH that starts
+  // with a literal "#", never a heading — so it never splits a Main Prompt.
+  var ATX_H1_RE = /^ {0,3}#(?!#)[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
+  function headingTitle(raw) {
+    return String(raw).replace(/\\([\\`*_{}\[\]()#+\-.!])/g, "$1").replace(/[*_`]+/g, "").trim();
+  }
+  // Code-fence state for a line-by-line scan: call it with each line; it
+  // returns true for a fence line or a line inside a fence. A fence closes only
+  // on the SAME character with at least the opening length (CommonMark), so a
+  // "```" line inside a "````" block, or "~~~" inside "```", is content.
+  function fenceTracker() {
+    var open = null;
+    return function (L) {
+      var m;
+      if (open) {
+        m = L.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+        if (m && m[1].charAt(0) === open.ch && m[1].length >= open.len) open = null;
+        return true;
+      }
+      m = L.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      // a backtick fence's info string can't contain a backtick ("``` x`" is inline code)
+      if (m && !(m[1].charAt(0) === "`" && m[2].indexOf("`") !== -1)) { open = { ch: m[1].charAt(0), len: m[1].length }; return true; }
+      return false;
+    };
+  }
+  // A setext H1 ("Title" over "===") that names a bucket, written by
+  // innerBucketH1s, back to "# Title" (outside code fences).
+  function restoreInnerH1s(text) {
+    var lines = String(text).split("\n"), inFence = fenceTracker(), out = [];
     for (var i = 0; i < lines.length; i++) {
       var L = lines[i];
-      if (/^\s{0,3}(```|~~~)/.test(L)) { inFence = !inFence; continue; }
-      if (inFence) continue;
-      // "# Title" (from an <h1>) or "\# Title" (a literal "#" Turndown escaped)
-      var m = L.match(/^\s{0,3}\\?#(?!#)[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+      if (inFence(L)) { out.push(L); continue; }
+      if (i + 1 < lines.length && /^ {0,3}=+[ \t]*$/.test(lines[i + 1]) && /\S/.test(L) &&
+          (i === 0 || !/\S/.test(lines[i - 1])) && !/^ {0,3}([-*+>#]|\d+[.)]|`{3}|~{3})/.test(L) &&
+          canonicalSection(headingTitle(L))) {
+        // drop the separator line innerBucketH1s added, and the one escape it added
+        if (i > 0 && lines[i - 1] === INNER_H1_GAP && out.length && out[out.length - 1] === INNER_H1_GAP) out.pop();
+        var T = L.trim();
+        if (/^\\+([-*+>#=]|`{3}|~{3})/.test(T)) T = T.slice(1);
+        else if (/^\d+\\+[.)]/.test(T)) T = T.replace(/^(\d+)\\/, "$1");
+        out.push("# " + T); i++; continue;
+      }
+      out.push(L);
+    }
+    return out.join("\n");
+  }
+  function splitMainPrompt(md) {
+    var lines = String(md || "").replace(/\r\n?/g, "\n").split("\n");
+    var heads = [], inFence = fenceTracker();
+    for (var i = 0; i < lines.length; i++) {
+      var L = lines[i];
+      if (inFence(L)) continue;
+      var m = L.match(ATX_H1_RE);
       if (!m) continue;
-      var title = m[1].replace(/\\([\\`*_{}\[\]()#+\-.!])/g, "$1").replace(/[*_`]+/g, "").trim();
+      var title = headingTitle(m[1]);
       var sec = canonicalSection(title);
       // An H1 that isn't a section name (e.g. "# Intro" inside Objective) is
       // ordinary content of the section it sits in — never a split point.
@@ -656,7 +1348,7 @@
     var parts = {};
     heads.forEach(function (hd, idx) {
       var end = idx + 1 < heads.length ? heads[idx + 1].line : lines.length;
-      parts[hd.key] = lines.slice(hd.line + 1, end).join("\n").trim();
+      parts[hd.key] = restoreInnerH1s(lines.slice(hd.line + 1, end).join("\n").trim());
     });
     var pre = lines.slice(0, heads[0].line).join("\n").replace(/<!--[\s\S]*?-->/g, "").trim();
     if (pre) {
@@ -688,35 +1380,43 @@
   function liveMainSplit() {
     try {
       var mp = twoFieldEditors().mp;
-      if (!mp) return { ok: false, reason: "Main Prompt editor not found on this page.", present: [] };
-      var md = window.PPExtract.toMarkdown(mp.innerHTML || "");
-      var r = splitMainPrompt(md);
-      r.present = mainHeadingKeys(md);
-      return r;
-    } catch (e) { return { ok: false, reason: "Couldn't read Main Prompt.", present: [] }; }
-  }
-  // Which of the 4 standard # headings appear in a Main Prompt (any order).
-  function mainHeadingKeys(md) {
-    var lines = String(md || "").replace(/\r\n?/g, "\n").split("\n"), out = [], inFence = false;
-    for (var i = 0; i < lines.length; i++) {
-      var L = lines[i];
-      if (/^\s{0,3}(```|~~~)/.test(L)) { inFence = !inFence; continue; }
-      if (inFence) continue;
-      var m = L.match(/^\s{0,3}\\?#(?!#)[ \t]+(.+?)[ \t]*#*[ \t]*$/);
-      if (!m) continue;
-      var sec = canonicalSection(m[1].replace(/[*_`\\]+/g, "").trim());
-      if (sec && MAIN_SPLIT_KEYS.indexOf(sec.key) !== -1 && out.indexOf(sec.key) === -1) out.push(sec.key);
-    }
-    return out;
+      // New layout, another section open: the download reads the Prompt section and checks then.
+      if (!mp && d2OffPrompt()) return { ok: true, deferred: true, reason: "" };
+      if (!mp) return { ok: false, reason: "Main Prompt editor not found on this page." };
+      return splitMainPrompt(window.PPExtract.toMarkdown(liveEditorHtml(mp), { html: true }));
+    } catch (e) { return { ok: false, reason: "Couldn't read Main Prompt." }; }
   }
 
-  function fallbackSections() { return isTwoField() ? [] : buildSections(); }
+  // An editor's live HTML without the DOM-only decorations the editor adds
+  // (they are not part of the saved text): a plain {{x}} the new layout wraps in
+  // span.mention-unknown-text, @-suggestion spans, the separator image and the
+  // trailing <br> ProseMirror keeps at the end of a block.
+  function liveEditorHtml(ed) {
+    var c = ed.cloneNode(true);
+    [].slice.call(c.querySelectorAll("img.ProseMirror-separator, br.ProseMirror-trailingBreak")).forEach(function (n) { n.remove(); });
+    [].slice.call(c.querySelectorAll("span.mention-unknown-text, span.suggestion")).forEach(function (n) {
+      if (n.getAttribute("data-type") === "mention") return;
+      while (n.firstChild) n.parentNode.insertBefore(n.firstChild, n);
+      n.remove();
+    });
+    return c.innerHTML || "";
+  }
+
+  function fallbackSections() { return isTwoField() ? [] : exportFallbackSections(); }
 
   // One place that performs a download in either format, on either site.
   function doDownload(format, sections) {
     var secs = (sections && sections.length) ? sections : fallbackSections();
     if (format === "magic") {
       return downloadMagicPort(secs);
+    }
+    // Nothing read from the page (it hasn't loaded its sections): say so, and
+    // don't download a ZIP of empty placeholder files.
+    if (!secs.some(function (s) { return s && s.text && String(s.text).trim(); })) {
+      toast(isTwoField() && d2NewUi()
+        ? "Nothing to export — couldn't read the Prompt section. Open it, wait for it to load, then try again."
+        : NOTHING_TO_EXPORT, null, "info");
+      return false;
     }
     if (format === "two") {
       downloadZipTwo(secs);
@@ -751,13 +1451,27 @@
   // order prefix ("1_First_Message", "02-objective", "4_Conversation_Flow"),
   // any folder path, and name variants (Conversation Flow ↔ Conversation Script).
   function fileStem(fileName) {
-    return String(fileName || "").split("/").pop()
+    return String(fileName || "").split(/[\\/]/).pop()
       .replace(/\.(md|markdown|txt)$/i, "")
       .replace(/\s*(\(\d+\)|[-_ ]copy(\s*\(?\d+\)?)?)\s*$/i, "")
       .trim();
   }
   function matchSection(fileName) {
     var base = fileStem(fileName);
+    var hit = matchStem(base);
+    if (hit) return hit;
+    // An exported name with something put in front of it ("x10-1730-2_Objective",
+    // "Bot - 4_Conversation_Script"): match the numbered export name at the end.
+    for (var i = 1; i < base.length; i++) {
+      if (!/[-_ .]/.test(base.charAt(i - 1))) continue;
+      var tail = base.slice(i);
+      if (!/^\d{1,2}[-_ .]+[^\d\s]/.test(tail)) continue;
+      hit = matchStem(tail);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  function matchStem(base) {
     var stripped = base.replace(/^\s*\d+\s*[-_.)\]]*\s*/, ""); // drop "1_", "02-", "7 ", "3."
     var cands = [normName(base)];
     var ns = normName(stripped);
@@ -779,25 +1493,48 @@
   var SANI_ALLOWED = { P:1,BR:1,STRONG:1,B:1,EM:1,I:1,U:1,S:1,CODE:1,PRE:1,BLOCKQUOTE:1,
     H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,UL:1,OL:1,LI:1,TABLE:1,THEAD:1,TBODY:1,TR:1,TH:1,TD:1,
     SPAN:1,A:1,HR:1,DIV:1,DEL:1,STRIKE:1 };
+  // Removed WITH their content (code, media, embedded documents). Every other
+  // non-allowed element is unwrapped: its (cleaned) text stays.
   var SANI_DANGER = { SCRIPT:1,STYLE:1,IFRAME:1,OBJECT:1,EMBED:1,LINK:1,META:1,BASE:1,
-    IMG:1,SVG:1,MATH:1,VIDEO:1,AUDIO:1,SOURCE:1,CANVAS:1,FORM:1,INPUT:1,BUTTON:1,TEXTAREA:1,SELECT:1 };
+    IMG:1,SVG:1,MATH:1,VIDEO:1,AUDIO:1,SOURCE:1,CANVAS:1,INPUT:1,TEMPLATE:1,NOSCRIPT:1,NOEMBED:1,NOFRAMES:1,FRAME:1,FRAMESET:1 };
+  // Links may only point at web / mail / phone addresses.
+  var SANI_URL_PROTOCOLS = { "http:":1, "https:":1, "mailto:":1, "tel:":1 };
+  var SANI_SPAN_CLASSES = { "mention":1, "node-mention":1 };
+  function safeUrl(v) {
+    // The URL parser ignores C0/C1 control characters and whitespace, so a
+    // prefix check on the raw value can be fooled ("\u0001javascript:") — strip
+    // them first, then decide by the PARSED protocol.
+    var clean = String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, "").trim();
+    if (!clean) return null;
+    var proto;
+    try { proto = new URL(clean).protocol; } catch (e) { return null; }   // relative → no scheme → dropped
+    return SANI_URL_PROTOCOLS[String(proto).toLowerCase()] ? clean : null;
+  }
+  // Parse an HTML fragment straight into <body> (no wrapper element, so a stray
+  // "</div>" in the content can't close the wrapper and cut off the rest).
+  function parseBody(html) {
+    return new DOMParser().parseFromString("<!doctype html><body>" + String(html == null ? "" : html), "text/html").body;
+  }
   var SANI_ATTRS = {
     SPAN: ["data-type","data-id","data-label","data-display-label","data-mention-suggestion-char","class"],
-    A: ["href"], TH: ["colspan","rowspan"], TD: ["colspan","rowspan"], CODE: ["class"], PRE: ["class"]
+    A: ["href"], TH: ["colspan","rowspan"], TD: ["colspan","rowspan"], CODE: ["class"], PRE: ["class"],
+    OL: ["start"]   // a numbered list that continues after a paragraph ("3. …") keeps its number
   };
+  var SANI_HTML_NS = "http://www.w3.org/1999/xhtml";
   function sanitizeHtml(html) {
-    var doc;
-    try { doc = new DOMParser().parseFromString("<div id='__r'>" + String(html || "") + "</div>", "text/html"); }
+    var root;
+    try { root = parseBody(html); }
     catch (e) { return htmlToText(html); }
-    var root = doc.getElementById("__r");
     if (!root) return htmlToText(html);
     (function clean(node) {
       var kids = Array.prototype.slice.call(node.childNodes);
       kids.forEach(function (ch) {
         if (ch.nodeType === 8) { ch.parentNode.removeChild(ch); return; }   // comment
         if (ch.nodeType !== 1) return;                                       // text ok
-        var tag = ch.tagName;
-        if (SANI_DANGER[tag]) { ch.parentNode.removeChild(ch); return; }
+        // SVG / MathML elements report lower-case tag names: compare upper-case,
+        // and drop anything outside the HTML namespace WITH its content.
+        var tag = String(ch.localName || ch.tagName || "").toUpperCase();
+        if (SANI_DANGER[tag] || (ch.namespaceURI && ch.namespaceURI !== SANI_HTML_NS)) { ch.parentNode.removeChild(ch); return; }
         clean(ch); // clean subtree first
         if (!SANI_ALLOWED[tag]) { // unwrap unknown tag, keep its (cleaned) children
           while (ch.firstChild) ch.parentNode.insertBefore(ch.firstChild, ch);
@@ -809,9 +1546,15 @@
           var nm = a.name.toLowerCase();
           if (nm.indexOf("on") === 0 || allow.indexOf(nm) === -1) { ch.removeAttribute(a.name); return; }
           if (nm === "class" && (tag === "CODE" || tag === "PRE") && !/^language-[\w+#.-]+$/.test(a.value || "")) { ch.removeAttribute(a.name); return; }
+          if (nm === "start" && !/^\d{1,9}$/.test(String(a.value || "").trim())) { ch.removeAttribute(a.name); return; }
+          if (nm === "class" && tag === "SPAN") {
+            var cls = String(a.value || "").split(/\s+/).filter(function (c) { return SANI_SPAN_CLASSES[c]; });
+            if (cls.length) ch.setAttribute("class", cls.join(" ")); else ch.removeAttribute(a.name);
+            return;
+          }
           if (nm === "href") {
-            var v = (a.value || "").trim().toLowerCase().replace(/\s/g, "");
-            if (v.indexOf("javascript:") === 0 || v.indexOf("data:") === 0 || v.indexOf("vbscript:") === 0) ch.removeAttribute(a.name);
+            var u = safeUrl(a.value);
+            if (u == null) ch.removeAttribute(a.name); else if (u !== a.value) ch.setAttribute("href", u);
           }
         });
       });
@@ -820,16 +1563,7 @@
   }
 
   function mdToHtml(md) {
-    var html;
-    try {
-      if (window.marked && window.marked.parse) {
-        html = window.marked.parse(String(md || ""), { gfm: true, breaks: true, renderer: htmlSafeRenderer() }); // breaks:true — a line break typed in a .md file stays a line break (prompt authors expect that; strict markdown would join the lines)
-      }
-    } catch (e) {}
-    if (html == null) {
-      html = "<p>" + String(md || "").replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>") + "</p>";
-    }
-    return sanitizeHtml(html); // never paste unsanitized HTML into the page
+    return sanitizeHtml(renderMarkdown(md)); // never paste unsanitized HTML into the page
   }
 
   // A bare variable token in the exported markdown, in any of the 3 Dash5 forms:
@@ -845,11 +1579,16 @@
   // Walk the text nodes of an HTML string and wrap every bare mention token in a
   // <span data-type="mention" data-id="…"> so the editor re-hydrates the chip.
   // Tokens already inside a mention span are left alone.
-  function hydrateMentions(html) {
-    var doc;
-    try { doc = new DOMParser().parseFromString("<div id='__h'>" + String(html || "") + "</div>", "text/html"); }
+  // opts.varsOnly (the 2-field dashboard): its editor only has VARIABLE chips —
+  // a mention span for @((…)) or @||…|| becomes a broken "unknown variable"
+  // chip ({{{{((x))}}}}), so only @{{…}} is wrapped and the other two forms stay
+  // as plain text exactly as written.
+  function isVariableToken(tok) { return /^@+\{\{/.test(tok); }
+  function hydrateMentions(html, opts) {
+    var varsOnly = !!(opts && opts.varsOnly);
+    var doc, root;
+    try { root = parseBody(html); doc = root.ownerDocument; }
     catch (e) { return String(html || ""); }
-    var root = doc.getElementById("__h");
     if (!root) return String(html || "");
     var walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     var nodes = [], n;
@@ -862,11 +1601,14 @@
       // Don't double-wrap tokens already inside a mention chip.
       var p = tn.parentNode;
       if (p && p.closest && p.closest('[data-type="mention"], .mention, .node-mention')) return;
+      // Text inside code is code: a token there stays literal text, never a chip.
+      if (p && p.closest && p.closest("code, pre")) return;
       MENTION_TOKEN_RE.lastIndex = 0;
       var frag = doc.createDocumentFragment(), last = 0, m;
       while ((m = MENTION_TOKEN_RE.exec(text))) {
-        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
         var tok = m[0];                       // "@{{callee_name}}"
+        if (varsOnly && !isVariableToken(tok)) continue; // stays in the text run as written (emitted with the next slice)
+        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
         var id = tok.replace(/^@+/, "");      // "{{callee_name}}"
         var span = doc.createElement("span");
         span.setAttribute("data-type", "mention");
@@ -885,32 +1627,211 @@
   // variable tokens re-wrapped as mention spans, then sanitized. Pasting THIS as
   // text/html makes Dash5 render the formatting AND rebuild the variable chips —
   // matching the source, instead of plain-pasting literal markdown.
-  // Raw HTML inside the markdown: real tags (formatting, tables we exported as
-  // HTML, comments) pass through to the sanitizer; anything else that merely
-  // LOOKS like a tag — "<angle>", "<customer name>", "a < b" — is prompt text
-  // and must survive as text instead of being swallowed as an unknown element.
-  var KNOWN_TAG = /^<\/?(p|br|hr|strong|b|em|i|u|s|del|strike|code|pre|blockquote|h[1-6]|ul|ol|li|table|thead|tbody|tfoot|tr|th|td|colgroup|col|span|a|div|sub|sup|img|script|style|iframe|object|embed|link|meta|base|svg|math|video|audio|source|canvas|form|input|button|textarea|select|option|label|section|article|header|footer|nav|main|figure|figcaption|details|summary|mark|small|big|font|center)\b[^>]*>|^<!--[\s\S]*?-->/i;
+  // Raw HTML inside the markdown: only FORMATTING tags (the ones the editors
+  // have) are kept as tags, and only when they are well-formed: allowed
+  // attributes only, and a paired tag only when its closing tag follows in the
+  // same block. Everything else that merely LOOKS like a tag — "<select one
+  // option>", "<link>", "</div>", "<a lot>", a lone "<b>" — is prompt text and is
+  // kept as literal text (never swallowed as an element, never truncating what
+  // follows). HTML comments are dropped (exporter placeholders).
+  var KNOWN_TAG = /^<(\/?)(b|i|em|strong|u|s|del|strike|code|pre|br|p|ul|ol|li|h[1-6]|blockquote|table|thead|tbody|tr|th|td|hr|a|span)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>/i;
+  var KNOWN_COMMENT = /^<!--[\s\S]*?-->/;
+  var TAG_ATTRS = { a: ["href"], td: ["colspan", "rowspan"], th: ["colspan", "rowspan"], code: ["class"], pre: ["class"], ol: ["start"],
+    span: ["data-type", "data-id", "data-label", "data-display-label", "data-mention-suggestion-char", "class"] };
+  var VOID_TAGS = { br: 1, hr: 1 };
+  var INLINE_TAGS = { b: 1, i: 1, em: 1, strong: 1, u: 1, s: 1, del: 1, strike: 1, code: 1, a: 1, span: 1 };
+  var TAG_MARK_A = "\uFDD0", TAG_MARK_B = "\uFDD1";
+  var _tagStash = [];
+  // Is this raw tag one we keep? Returns {name, close} or null.
+  function formattingTag(raw) {
+    var m = raw.match(KNOWN_TAG);
+    if (!m || m[0].length !== raw.length) return null;
+    var name = m[2].toLowerCase(), close = !!m[1], attrs = m[3] || "";
+    if (close && (attrs.trim() || m[4])) return null;
+    var allow = TAG_ATTRS[name] || [], seen = {}, ok = true, ar = /([^\s"'>\/=]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g, am;
+    while ((am = ar.exec(attrs))) {
+      var an = am[1].toLowerCase(), av = (am[2] || "").replace(/^["']|["']$/g, "");
+      if (allow.indexOf(an) === -1 || seen[an]) { ok = false; break; }
+      seen[an] = av;
+    }
+    if (!ok) return null;
+    if (name === "span" && !close && seen["data-type"] !== "mention") return null;
+    return { name: name, close: close };
+  }
+  // Each raw tag is stashed behind a marker while marked renders; the markers
+  // are resolved once the whole document is known (so pairing can be checked).
+  function stashTag(raw) {
+    var t = formattingTag(raw);
+    if (!t) return esc(raw);
+    _tagStash.push({ raw: raw, name: t.name, close: t.close });
+    return TAG_MARK_A + (_tagStash.length - 1) + TAG_MARK_B;
+  }
+  var BLOCK_EDGE = /<\/?(p|li|h[1-6]|td|th|blockquote|pre|ul|ol|table|tr|div|hr)\b/i;
+  function resolveTagMarks(html) {
+    var re = new RegExp(TAG_MARK_A + "(\\d+)" + TAG_MARK_B, "g"), m, toks = [];
+    while ((m = re.exec(html))) toks.push({ i: +m[1], at: m.index, end: m.index + m[0].length });
+    if (!toks.length) return html;
+    var keep = {}, stack = [];
+    toks.forEach(function (tk) {
+      var t = _tagStash[tk.i]; if (!t) return;
+      if (VOID_TAGS[t.name]) { keep[tk.i] = true; return; }
+      if (!t.close) { stack.push(tk); return; }
+      for (var j = stack.length - 1; j >= 0; j--) {
+        var o = stack[j], ot = _tagStash[o.i];
+        if (ot.name !== t.name) continue;
+        // An inline tag must open and close inside the same block.
+        if (INLINE_TAGS[t.name] && BLOCK_EDGE.test(html.slice(o.end, tk.at).replace(re, ""))) break;
+        keep[o.i] = keep[tk.i] = true;
+        stack.splice(j, 1);
+        break;
+      }
+    });
+    return html.replace(re, function (all, i) {
+      var t = _tagStash[+i];
+      return !t ? "" : keep[+i] ? t.raw : esc(t.raw);
+    });
+  }
   var _safeRenderer = null;
   function htmlSafeRenderer() {
     if (_safeRenderer || !window.marked || !window.marked.Renderer) return _safeRenderer;
     var r = new window.marked.Renderer();
-    r.html = function (html) {
+    r.html = function (html, block) {
       var src = typeof html === "object" && html ? (html.text || html.raw || "") : String(html || "");
-      // Keep known tags; escape everything else as literal text.
+      if (typeof html === "object" && html) block = !!html.block;
+      if (block) {
+        // An HTML block whose "tags" are all text (e.g. a line starting with
+        // "<select one option>") is ordinary markdown: render it as such, with
+        // every "<" taken literally.
+        var noComments = src.replace(/<!--[\s\S]*?(-->|$)/g, "");
+        var anyTag = false, tr = /<\/?[A-Za-z][^>]*>/g, tm;
+        while ((tm = tr.exec(noComments))) { if (formattingTag(tm[0])) { anyTag = true; break; } }
+        if (!anyTag) {
+          if (!noComments.trim()) return "";
+          return renderMarkdownRaw(noComments.replace(/</g, "\\<"));
+        }
+      }
       var out = "", rest = src;
       while (rest.length) {
         var lt = rest.indexOf("<");
         if (lt === -1) { out += esc(rest); break; }
         out += esc(rest.slice(0, lt));
         rest = rest.slice(lt);
-        var m = rest.match(KNOWN_TAG);
-        if (m) { out += m[0]; rest = rest.slice(m[0].length); }
+        var c = rest.match(KNOWN_COMMENT);
+        if (c) { out += c[0]; rest = rest.slice(c[0].length); continue; }
+        var m = rest.match(/^<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*\s*\/?>/);
+        if (m) { out += stashTag(m[0]); rest = rest.slice(m[0].length); }
         else { out += "&lt;"; rest = rest.slice(1); }
       }
       return out;
     };
     _safeRenderer = r;
     return r;
+  }
+
+  // A private marked instance: GFM + "a typed line break stays a line break",
+  // with three literal-text rules so text typed in the page survives an
+  // export → import round trip exactly:
+  //   - "~x~" (single tildes) is text; only "~~x~~" is strikethrough;
+  //   - "&nbsp;", "&amp;" typed as text stay those characters (entities are
+  //     not decoded in markdown text);
+  //   - "1) Greet" at the start of a line is a sentence, not a numbered list
+  //     (the editors' own lists export as "1." — see escapeParenLists).
+  var _mdInst = null;
+  function markedInstance() {
+    if (_mdInst) return _mdInst;
+    if (!window.marked) return null;
+    if (typeof window.marked.Marked !== "function") return null;
+    var inst = new window.marked.Marked({ gfm: true, breaks: true, renderer: htmlSafeRenderer() }); // breaks:true — a line break typed in a .md file stays a line break (prompt authors expect that; strict markdown would join the lines)
+    var protoTok = window.marked.Tokenizer && window.marked.Tokenizer.prototype;
+    inst.use({ tokenizer: {
+      // Long blocks are lexed in line-aligned pieces (see mdInlineChunks): marked
+      // re-copies the whole inline text once per backslash escape, so one huge
+      // paragraph of "1\) step" / "\*" lines took seconds (quadratic).
+      paragraph: function (src) {
+        var cap = this.rules.block.paragraph.exec(src);
+        if (!cap) return undefined;
+        var text = cap[1].charAt(cap[1].length - 1) === "\n" ? cap[1].slice(0, -1) : cap[1];
+        return { type: "paragraph", raw: cap[0], text: text, tokens: mdInlineChunks(this.lexer, text) };
+      },
+      text: function (src) {
+        var cap = this.rules.block.text.exec(src);
+        if (!cap) return undefined;
+        return { type: "text", raw: cap[0], text: cap[0], tokens: mdInlineChunks(this.lexer, cap[0]) };
+      },
+      // A link is looked for in a bounded window: marked's link pattern scans to
+      // the next space at every "[", so 100 KB of "[a](" took seconds. A link
+      // whose markdown is longer than the window stays text.
+      link: function (src) {
+        if (src.length <= MD_LINK_MAX || !protoTok || !protoTok.link) return false;
+        return protoTok.link.call(this, src.slice(0, MD_LINK_MAX)) || undefined;
+      },
+      // Only "~~x~~" is strikethrough (single "~" is text). The struck text may
+      // itself start/end with a literal "~" ("~~~approx~~~" = struck "~approx~").
+      del: function (src) {
+        var m = /^~~(?!\s)([\s\S]*?\S)~~(?!~)/.exec(src);
+        if (!m) return undefined;
+        return { type: "del", raw: m[0], text: m[1], tokens: this.lexer.inlineTokens(m[1]) };
+      },
+      inlineText: function (src) {
+        var t = this.rules.inline.text.exec(src);
+        if (!t) return undefined;
+        var raw = t[0];
+        return { type: "text", raw: raw, text: this.lexer.state.inRawBlock ? raw : raw.replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        }) };
+      }
+    } });
+    _mdInst = inst;
+    return inst;
+  }
+  // Inline tokens of a long block, lexed in pieces of whole lines (each piece
+  // after the first starts with its line break, which still renders as <br>).
+  // A piece only ends where nothing can span the break: an even number of
+  // backticks so far, and a line not ending in a hard-break marker ("\\" or two
+  // spaces). Short blocks (every normal prompt) are lexed whole, as before.
+  var MD_CHUNK = 4096, MD_LINK_MAX = 2048;
+  function mdInlineChunks(lexer, text) {
+    if (text.length <= MD_CHUNK * 2) return lexer.inline(text);
+    var tokens = [], lines = text.split("\n"), buf = "", ticks = 0, first = true;
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      buf += (i ? "\n" : "") + ln;
+      ticks += (ln.match(/`/g) || []).length;
+      if (i < lines.length - 1 && buf.length >= MD_CHUNK && ticks % 2 === 0 && !/(\\| {2,})$/.test(ln) && lines[i + 1].trim()) {
+        lexer.inline(buf, tokens);   // queued: marked fills `tokens` piece by piece, in order
+        buf = ""; first = false;
+      }
+    }
+    if (buf || first) lexer.inline(buf, tokens);
+    return tokens;
+  }
+  // "1) text" / "- 2) text" at a line start → "1\) text" (literal), outside fences.
+  function escapeParenLists(md) {
+    var inFence = false;
+    return String(md == null ? "" : md).split("\n").map(function (line) {
+      if (/^\s{0,3}(```|~~~)/.test(line)) { inFence = !inFence; return line; }
+      if (inFence) return line;
+      return line.replace(/^(\s*(?:(?:[-*+]|\d{1,9}\.)[ \t]+|>[ \t]?)*)(\d{1,9})\)(?=[ \t]|$)/, "$1$2\\)");
+    }).join("\n");
+  }
+  function renderMarkdownRaw(md) {
+    var inst = markedInstance();
+    if (inst) return inst.parse(String(md == null ? "" : md));
+    if (window.marked && window.marked.parse) return window.marked.parse(String(md == null ? "" : md), { gfm: true, breaks: true, renderer: htmlSafeRenderer() });
+    return null;
+  }
+  function renderMarkdown(md) {
+    // Control characters (other than tab / line breaks) never reach an editor.
+    md = escapeParenLists(String(md == null ? "" : md).replace(/[\uFDD0\uFDD1\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, ""));
+    var html = null;
+    _tagStash = [];
+    try { html = renderMarkdownRaw(md); } catch (e) { html = null; }
+    if (html == null) {
+      html = "<p>" + esc(md).replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>") + "</p>";
+    }
+    html = resolveTagMarks(String(html));
+    _tagStash = [];
+    return html;
   }
 
   // In a markdown TABLE row, the @||tool|| variable's pipes would be read as
@@ -924,21 +1845,38 @@
     }).join("\n");
   }
 
+  // Older exports of a damaged 2-field chip carry extra {{ }} wraps:
+  // "@{{{{||send_payment_link||}}}}", "@{{{{((greetings.date))}}}}",
+  // "@{{{{callee_name}}}}" (sometimes with "\_" escapes inside). Heal them to
+  // "@||send_payment_link||", "@((greetings.date))", "@{{callee_name}}" before
+  // importing, so a damaged token never travels on as literal text.
+  var DAMAGED_TOKEN_RE = /@((?:\{\{){2,})(\(\([^()\n]+\)\)|\|\|[^|\n]+\|\||[A-Za-z0-9_.\\-]+)((?:\}\}){2,})/g;
+  function healDamagedTokens(md) {
+    return String(md == null ? "" : md).replace(DAMAGED_TOKEN_RE, function (all, open, inner, close) {
+      if (open.length !== close.length) return all;
+      inner = inner.replace(/([A-Za-z0-9])\\_(?=[A-Za-z0-9])/g, "$1_");
+      return /^(\(\(|\|\|)/.test(inner) ? "@" + inner : "@{{" + inner + "}}";
+    });
+  }
+
+  // How many @((…)) / @||…|| references a markdown text holds — on the 2-field
+  // dashboard these are kept as plain text (see hydrateMentions varsOnly).
+  function countNonVariableRefs(md) {
+    var re = new RegExp(MENTION_TOKEN_RE.source, "g"), m, n = 0, s = healDamagedTokens(md || "");
+    while ((m = re.exec(s))) if (!isVariableToken(m[0])) n++;
+    return n;
+  }
+  function plainRefsNote(n) {
+    return n ? n + " reference" + (n === 1 ? "" : "s") + " kept as plain text (@((…)) / @||…||): the 2-field dashboard has chips for variables only." : "";
+  }
+
   function mdToHydratedHtml(md) {
-    md = protectPipeTokens(md);
-    var html;
-    try {
-      if (window.marked && window.marked.parse) {
-        html = window.marked.parse(String(md || ""), { gfm: true, breaks: true, renderer: htmlSafeRenderer() }); // breaks:true — a line break typed in a .md file stays a line break (prompt authors expect that; strict markdown would join the lines)
-      }
-    } catch (e) {}
-    if (html == null) {
-      html = "<p>" + String(md || "").replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>") + "</p>";
-    }
+    md = protectPipeTokens(healDamagedTokens(md));
+    var html = renderMarkdown(md);
     // marked ends every code block with a newline the editor would keep as a
     // real blank line at the bottom of the block — drop it.
     html = String(html).replace(/\n<\/code><\/pre>/g, "</code></pre>");
-    html = hydrateMentions(html);
+    html = hydrateMentions(html, { varsOnly: isTwoField() });
     html = sanitizeHtml(html); // keeps mention spans + formatting, strips anything unsafe
     html = collapseStructuralWhitespace(html);
     if (isTwoField()) html = breaksToParagraphs(html);
@@ -950,11 +1888,13 @@
   // separate paragraphs instead, so every line stays on its own line.
   var BR_BLOCKS = "p,li,td,th,h1,h2,h3,h4,h5,h6,blockquote";
   function breaksToParagraphs(html) {
+    // The new layout's editor has no code blocks either: a pasted <pre> becomes
+    // ONE paragraph with its lines run together. Give each line its own <p>.
+    if (/<pre\b/i.test(String(html || "")) && d2NewUi()) html = preToParagraphs(html);
     if (!/<br\b/i.test(String(html || ""))) return String(html || "");
-    var doc;
-    try { doc = new DOMParser().parseFromString("<div id='__b'>" + String(html || "") + "</div>", "text/html"); }
+    var doc, root;
+    try { root = parseBody(html); doc = root.ownerDocument; }
     catch (e) { return String(html || ""); }
-    var root = doc.getElementById("__b");
     if (!root) return String(html || "");
     var guard = 0, br;
     while ((br = root.querySelector("br")) && guard++ < 5000) {
@@ -991,6 +1931,24 @@
     return root.innerHTML;
   }
 
+  function preToParagraphs(html) {
+    var root;
+    try { root = parseBody(html); } catch (e) { return String(html || ""); }
+    if (!root) return String(html || "");
+    var doc = root.ownerDocument;
+    [].slice.call(root.querySelectorAll("pre")).forEach(function (pre) {
+      var frag = doc.createDocumentFragment();
+      String(pre.textContent || "").replace(/\r\n?/g, "\n").split("\n").forEach(function (line) {
+        if (!line.trim()) return;                 // an empty <p> would be a stray blank line
+        var p = doc.createElement("p");
+        p.textContent = line;
+        frag.appendChild(p);
+      });
+      pre.parentNode.replaceChild(frag, pre);
+    });
+    return root.innerHTML;
+  }
+
   // marked pretty-prints with newlines between block tags ("</p>\n<p>",
   // "<ol>\n<li>"). When ProseMirror ingests that HTML, each of those inter-block
   // whitespace text nodes becomes an empty spacer paragraph — blank lines between
@@ -1003,10 +1961,9 @@
     BLOCKQUOTE:1, PRE:1, HR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, COLGROUP:1, COL:1 };
   function isBlockNode(n) { return n.nodeType === 1 && !!BLOCK_TAGS[n.tagName]; }
   function collapseStructuralWhitespace(html) {
-    var doc;
-    try { doc = new DOMParser().parseFromString("<div id='__w'>" + String(html || "") + "</div>", "text/html"); }
+    var root;
+    try { root = parseBody(html); }
     catch (e) { return String(html || ""); }
-    var root = doc.getElementById("__w");
     if (!root) return String(html || "");
     (function walk(node) {
       Array.prototype.slice.call(node.childNodes).forEach(function (ch) {
@@ -1034,54 +1991,6 @@
       .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
       .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
       .trim();
-  }
-
-  // Replace a rich editor's content with MARKDOWN, exactly like a human paste.
-  // Dash5's editor (TipTap/ProseMirror) renders markdown from the clipboard's
-  // text/plain — pipes become real tables, ## become headings, ** become bold,
-  // "- " become lists. So we paste the RAW markdown as text/plain (NOT HTML,
-  // and NOT flattened text, which is what dropped tables before). We first fire
-  // Cmd/Ctrl+A so the editor selects all and the paste REPLACES its content.
-  function pasteMarkdownIntoEditor(editorEl, markdown) {
-    return new Promise(function (resolve) {
-      var before = (editorEl.innerText || editorEl.textContent || "");
-      function selectAll() {
-        try { editorEl.focus(); } catch (e) {}
-        // ProseMirror maps Mod-a to select-all; send both meta (mac) and ctrl.
-        ["Meta", "Control"].forEach(function (mod) {
-          try {
-            editorEl.dispatchEvent(new KeyboardEvent("keydown", {
-              key: "a", code: "KeyA", keyCode: 65, which: 65,
-              bubbles: true, cancelable: true,
-              metaKey: mod === "Meta", ctrlKey: mod === "Control"
-            }));
-          } catch (e) {}
-        });
-        // Fallback DOM selection (covers plain contenteditables).
-        try {
-          var sel = window.getSelection(); var r = document.createRange();
-          r.selectNodeContents(editorEl); sel.removeAllRanges(); sel.addRange(r);
-        } catch (e) {}
-      }
-      function pasteText(txt) {
-        var dt = new DataTransfer();
-        dt.setData("text/plain", txt);
-        var ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
-        try { Object.defineProperty(ev, "clipboardData", { value: dt }); } catch (e) {}
-        editorEl.dispatchEvent(ev);
-      }
-      selectAll();
-      pasteText(markdown);
-      setTimeout(function () {
-        var now = (editorEl.innerText || editorEl.textContent || "");
-        if (now !== before) { resolve(true); return; }
-        // Editor ignored the synthetic paste — insert the text directly.
-        try { selectAll(); document.execCommand("insertText", false, markdown); } catch (e) {}
-        setTimeout(function () {
-          resolve((editorEl.innerText || editorEl.textContent || "") !== before);
-        }, 90);
-      }, 150);
-    });
   }
 
   // A pasted result is "dirty" if the editor ended up with an empty spacer
@@ -1114,6 +2023,22 @@
       // turns into one clean empty paragraph (verified live on Dash2).
       var clearing = expected === "";
       function curText() { return (editorEl.innerText || editorEl.textContent || "").replace(/\s+/g, " ").trim(); }
+      // What was there before: a paste only "registered" if the text changed, or
+      // already reads what we sent (a read-only editor that ignored the paste
+      // leaves the old text in place — that's a failure, not a success).
+      var before = curText();
+      // Variable chips read "{{x}}" on the page but "@{{x}}" / "@((x))" in the
+      // sent HTML: compare without the chip punctuation, or an identical
+      // re-import (nothing changes) is wrongly reported as "didn't take".
+      function squash(t) { return String(t || "").replace(/[\s{}()|@\u200b\ufeff]+/g, ""); }
+      var sentText = expected;
+      try { sentText = parseBody(html).textContent; } catch (e) {}
+      function accepted() {
+        var now = curText();
+        if (expected === "") return now === "";
+        if (!now) return false;
+        return now !== before || squash(now) === squash(sentText);
+      }
       function selectAllAndPaste() {
         try {
           editorEl.scrollIntoView({ block: "center" });
@@ -1169,7 +2094,7 @@
         attempt++;
         selectAllAndPaste();
         setTimeout(function () {
-          var registered = expected === "" ? curText() === "" : curText().length > 0;
+          var registered = accepted();
           // An emptied editor legitimately holds one empty paragraph.
           var clean = registered && (expected === "" || !hasSpacerArtifacts(editorEl));
           if (clean) { resolve(true); return; }
@@ -1224,7 +2149,7 @@
   }
 
   function isJunkEntry(name) {
-    var n = String(name || "");
+    var n = String(name || "").replace(/\\/g, "/");
     var base = n.split("/").pop();
     return /(^|\/)__MACOSX\//.test(n) || /^\./.test(base) || base === "" || /\/$/.test(n);
   }
@@ -1257,10 +2182,14 @@
       throw e;
     }
     var src = newSource();
-    (entries.skipped || []).forEach(function (s) { src.unmatched.push(s.name.split("/").pop() + " (" + s.why + ")"); });
+    (entries.skipped || []).forEach(function (s) {
+      var sn = String(s.name).split(/[\\/]/).pop();
+      if (isJunkEntry(s.name)) return;
+      src.unmatched.push(s.why === "not a prompt file" ? sn : sn + " (" + s.why + ")");
+    });
     entries.forEach(function (f) {
       if (isJunkEntry(f.name)) return;
-      var short = String(f.name).split("/").pop();
+      var short = String(f.name).split(/[\\/]/).pop();
       if (!/\.(md|markdown|txt)$/i.test(short)) { src.unmatched.push(short); return; }
       if (isMainPromptName(f.name)) {
         if (!addPart(src, "main-prompt", f.text)) src.unmatched.push(short + " (duplicate of Main Prompt — the first file was used)");
@@ -1280,8 +2209,15 @@
     var src = newSource();
     // A file named "Main Prompt" is the whole Main Prompt — unless it actually
     // carries a First Message section too (then it's a combined full prompt).
+    // (only a real "# First Message" heading counts — a "First message:" line
+    // inside the prompt is content)
+    var inFence = false;   // a "# First Message" inside a code fence is content (as in parseSingleMd)
     var hasFmHead = String(text || "").split(/\r?\n/).some(function (L) {
-      var sec = sectionHeaderAt(L); return sec && sec.key === "first-message";
+      if (/^\s{0,3}(```|~~~)/.test(L)) { inFence = !inFence; return false; }
+      if (inFence) return false;
+      var hm = L.match(/^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+      var sec = hm ? canonicalSection(hm[1].replace(/[*_`\\]+/g, "").trim()) : null;
+      return sec && sec.key === "first-message";
     });
     if (isMainPromptName(fileName) && !hasFmHead) {
       addPart(src, "main-prompt", text);
@@ -1337,6 +2273,12 @@
       MAIN_SPLIT_KEYS.forEach(function (k) { if (has(k)) bucket[k] = cleanText(P[k]); });
       if (has("main-prompt")) {
         var mp = String(P["main-prompt"] || "");
+        // A "# Main Prompt" title line on top (sections then under "##") is the
+        // file's title, not content: drop it so the sections can be split.
+        var mpLines = mp.replace(/\r\n?/g, "\n").split("\n"), mpFirst = 0;
+        while (mpFirst < mpLines.length && !mpLines[mpFirst].trim()) mpFirst++;
+        var mpTitle = mpFirst < mpLines.length && mpLines[mpFirst].match(/^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+        if (mpTitle && isMainHeading(mpTitle[1].replace(/[*_`\\]+/g, "").trim())) mp = mpLines.slice(mpFirst + 1).join("\n");
         var sp = splitMainPrompt(mp);
         var parts = null, how = "";
         if (sp.ok) {
@@ -1403,16 +2345,21 @@
         var cur = curMap["main-prompt"] || "";
         var csp = splitMainPrompt(cur);
         var names = Object.keys(incoming).map(bucketHeading).join(", ");
-        if (csp.ok) {
+        if (csp.ok || (csp.pre && csp.parts)) {
+          // Organised under # headings (text above the first heading is kept
+          // where it is): slot the incoming sections in, keep the rest.
           var merged = {};
           MAIN_SPLIT_KEYS.forEach(function (k) { merged[k] = csp.parts[k] || ""; });
           Object.keys(incoming).forEach(function (k) { merged[k] = incoming[k]; });
-          matched.push(mkMatch("main-prompt", collateMain(merged)));
-          notes.push("Only " + names + " will change inside Main Prompt — its other # sections are kept.");
+          var body = collateMain(merged);
+          matched.push(mkMatch("main-prompt", csp.pre ? csp.pre + (body ? "\n\n" + body : "") : body));
+          notes.push("Only " + names + " will change inside Main Prompt — its other # sections" +
+            (csp.pre ? " and the text above its first # heading are" : " are") + " kept.");
         } else {
           matched.push(mkMatch("main-prompt", collateMain(incoming)));
           if (meaningful(cur)) {
-            notes.push("The current Main Prompt isn't organised under # section headings, so " + names +
+            notes.push("The current Main Prompt couldn't be split into its # sections (" +
+              String(csp.reason || "no section headings").replace(/\.$/, "") + "), so " + names +
               " can't be slotted in — the WHOLE Main Prompt will be replaced. Check the diff.");
           }
         }
@@ -1424,17 +2371,13 @@
     var emptied = matched.filter(function (m) {
       return !meaningful(m.file.text) && meaningful(curMap[m.sec.key]) && already.indexOf(m.sec.title) === -1;
     }).map(function (m) { return m.sec.title; });
-    if (emptied.length) notes.push("The file has no content for " + emptied.join(", ") + " — " + (emptied.length === 1 ? "that field" : "those fields") + " will be emptied.");
+    if (emptied.length) notes.push("The file has no content for " + emptied.join(", ") + " — " + (emptied.length === 1 ? "that field" : "those fields") +
+      (isTwoField() && d2NewUi() ? " can't be emptied on this dashboard (it keeps the old text) and will be left as is." : " will be emptied."));
 
     var seen = {};
     matched.forEach(function (m) { seen[m.sec.key] = true; });
     var missing = siteTargets().filter(function (t) { return !seen[t.key]; }).map(function (t) { return t.title; });
     return { matched: matched, unmatched: unmatched, missing: missing, notes: notes, detected: detected };
-  }
-
-  // Back-compat wrapper (and handy for tests): ZIP → plan for this site.
-  async function planImport(arrayBuffer) {
-    return resolveImportPlan(await readZipSource(arrayBuffer), null);
   }
 
   // Read the current fields, build the plan against them, show the review.
@@ -1446,7 +2389,7 @@
     var rd = el("div", "rs-note", "Reading the current fields on the page to build the diff…");
     rd.setAttribute("aria-live", "polite");
     panel.appendChild(rd);
-    runExclusive(collectSections).then(function (cur) {
+    return runExclusive(collectSections).then(function (cur) {
       var curMap = {};
       (cur || []).forEach(function (c) { curMap[c.key] = c.text || ""; });
       renderImportPlan(resolveImportPlan(src, curMap), curMap, src);
@@ -1479,13 +2422,24 @@
   }
   function pasteDrift(html, el) {
     try {
-      var tmp = document.createElement("div");
-      tmp.innerHTML = html;
+      // Parsed in an inert document (never innerHTML on this page's document).
+      var tmp = parseBody(html);
       var want = visibleText(tmp), got = visibleText(el);
       if (want === got) return "";
       var strip = function (x) { return x.replace(/[*_~`]/g, ""); };
       if (strip(want) === strip(got)) return "the editor turned some literal * _ ~ ` characters into formatting — review";
       return "text on the page differs from the file — review";
+    } catch (e) { return ""; }
+  }
+
+  // New layout limits (verified on QA 2026-11-05), reported — never worked around:
+  // an empty prompt field can't be stored, and a table makes Save fail (the
+  // editor adds style="min-width…" to tables and that request is rejected).
+  var V2_NO_CLEAR = "this dashboard can't empty a prompt field (Save keeps the old text) — left as it was";
+  function v2TableSaveWarning(el) {
+    try {
+      if (!d2NewUi() || !el || !el.querySelector("table")) return "";
+      return "it holds a table — on this dashboard Save can fail for tables (\"Couldn't save your changes\"); if it does, turn the table into a list and save again";
     } catch (e) { return ""; }
   }
 
@@ -1519,11 +2473,20 @@
       // (pasting raw markdown as text/plain rendered formatting but left variables
       // as literal "@{{…}}" text — the plain-paste bug).
       var html = mdToHydratedHtml(file.text);
+      // New layout: the server ignores an empty prompt field (Save answers OK
+      // and the old text comes back), so an empty file can't clear it. Leave
+      // the field as it is and say so instead of reporting a clear that won't stick.
+      if (d2NewUi() && isTwoField() && !htmlToText(html).replace(/\s+/g, "")) {
+        results.push({ title: sec.title, ok: false, reason: V2_NO_CLEAR });
+        continue;
+      }
       var ok = await pasteHtmlIntoEditor(el, html);
-      var res = { title: sec.title, ok: ok, reason: ok ? "" : "paste not registered" };
+      var res = { title: sec.title, ok: ok, reason: ok ? "" : "the field didn't accept the text (paste not registered)" };
       if (ok) {
         var drift = pasteDrift(html, el);
         if (drift) res.warn = drift;
+        var tw = v2TableSaveWarning(el);
+        if (tw) res.warn = (res.warn ? res.warn + "; " : "") + tw;
       }
       results.push(res);
       await sleep(150);
@@ -1543,7 +2506,15 @@
       var s = byKey[t.key] || { text: "" };
       return { sec: t, file: { name: t.filename, text: (s.text || "") } };
     });
-    return { when: new Date(), sections: sections, matched: matched, importedKeys: [] };
+    return { when: new Date(), sections: sections, matched: matched, importedKeys: [], botId: pageBotId(), pageKey: pageKeyNow() };
+  }
+  // A backup belongs to the bot (or, with no bot id in the address, the page) it
+  // was taken on: Undo is only offered and only allowed there.
+  function backupIsHere(b) {
+    if (!b) return false;
+    if (b.botId) return String(b.botId).toLowerCase() === pageBotId();
+    if (b.pageKey) return b.pageKey === pageKeyNow();
+    return true;
   }
 
   function backupWhat() { return isTwoField() ? "First Message + Main Prompt" : "the 5 buckets"; }
@@ -1568,55 +2539,70 @@
   // Restore the buckets the import overwrote to their pre-import content.
   async function undoLastImport(btn) {
     if (!_lastBackup) { toast("No backup to undo."); return; }
+    // A backup belongs to the bot it was taken on.
+    if (!backupIsHere(_lastBackup)) {
+      toast("This backup belongs to another bot — open that bot to undo, or download the backup.", null, "info");
+      return;
+    }
+    var keepF = focusKeeper();
     if (btn) { btn.disabled = true; btn.textContent = "Undoing…"; }
     setLinks(false);
+    // 2-field dashboard: the prompt editors exist only on the Prompt tab (a
+    // migration ends on another tab). Go there first, and write only when both
+    // labelled prompt editors are found — never into another tab's editor.
+    if (isTwoField()) {
+      try {
+        var MPI = window.MagicPortImport;
+        if (!(twoFieldEditors().fm && twoFieldEditors().mp)) {
+          if (d2NewUi()) await window.MagicPortDom.v2GotoSection("prompt", function () { var g = twoFieldEditors(); return !!(g.fm && g.mp); }, 6000);
+          else if (MPI && typeof MPI.gotoTab === "function") await MPI.gotoTab("Prompt", { budgetMs: 6000 });
+        }
+        for (var w = 0; w < 20 && !(twoFieldEditors().fm && twoFieldEditors().mp); w++) await sleep(150);
+      } catch (e) {}
+      var pe = twoFieldEditors();
+      if (!(pe.fm && pe.mp)) {
+        if (btn) { btn.disabled = false; btn.textContent = "Undo import"; }
+        keepF();
+        toast("Couldn't find the First Message and Main Prompt editors — open the Prompt tab and try Undo again.", null, "info");
+        return;
+      }
+    }
     var keys = (_lastBackup.importedKeys && _lastBackup.importedKeys.length)
       ? _lastBackup.importedKeys
       : _lastBackup.matched.map(function (m) { return m.sec.key; });
     var restore = _lastBackup.matched.filter(function (m) { return keys.indexOf(m.sec.key) !== -1; });
     var results = await runImport(restore);
     if (_lastBackup) _lastBackup.undone = true;
-    showImportResults(results, { undone: true }, btn && btn._gen);
+    showImportResults(results, { undone: true }, btn && btn._gen); keepF();
   }
+  // Undo writes the page: under the busy lock like any other import.
+  var undoLastImportUnlocked = undoLastImport;
+  undoLastImport = async function (btn) {
+    if (!ppLock("import")) { toast(ppBusyText(), null, "info"); return; }
+    try { return await undoLastImportUnlocked(btn); } finally { ppUnlock("import"); }
+  };
 
-  function openImportPicker(onPlan) {
+  // One file picker for every import entry point. The <input> is never added
+  // to the page (a cancelled picker used to leave one behind each time); the
+  // last one is only held here so it stays alive while the dialog is open.
+  var _pickerInput = null;
+  function pickFile(accept, onFile) {
     var input = document.createElement("input");
     input.type = "file";
-    input.accept = ".zip,application/zip";
-    input.style.display = "none";
-    document.body.appendChild(input);
+    input.accept = accept;
+    _pickerInput = input;
     input.addEventListener("change", function () {
       var file = input.files && input.files[0];
-      document.body.removeChild(input);
-      if (!file) return;
-      file.arrayBuffer().then(function (ab) {
-        return readZipSource(ab);
-      }).then(onPlan).catch(function (err) {
-        onPlan({ error: (err && err.message) || "Could not read the zip." });
-      });
+      if (_pickerInput === input) _pickerInput = null;
+      onFile(file);
     });
+    input.addEventListener("cancel", function () { if (_pickerInput === input) _pickerInput = null; });
     input.click();
   }
 
   // ========================================================================
   //  IMPORT: write a SINGLE .md file back into one or all buckets (smart)
   // ========================================================================
-  // Match a heading's text (e.g. "Response Guidelines") to a bucket.
-  function matchSectionByHeading(str) {
-    var n = normName(str);
-    if (!n) return null;
-    var secs = window.PPExtract.SECTIONS;
-    for (var i = 0; i < secs.length; i++) {
-      var sec = secs[i];
-      if (normName(sec.title) === n) return sec;
-      if (normName(sec.filename.replace(/\.md$/i, "")) === n) return sec;
-      for (var j = 0; j < sec.labels.length; j++) {
-        if (normName(sec.labels[j]) === n) return sec;
-      }
-    }
-    return null;
-  }
-
   // Recognize a section-delimiter LINE in many shapes and return its bucket:
   //   "# First Message", "## Objective", "**FAQs**",
   //   "Prompt 1 – First Message -", "Section 3: Response Guidelines",
@@ -1629,6 +2615,8 @@
   function sectionHeaderAt(line) {
     var raw = String(line || "").trim();
     if (!raw || raw.length > 60) return null;          // headers are short lines
+    // "- FAQs" / "* Objective" / "+ FAQs" is a bullet point in a list, not a header.
+    if (/^(>\s*)*[-*+][ \t]/.test(raw)) return null;
     var s = raw
       .replace(/^[#>\s]*/, "")                          // markdown heading / blockquote
       .replace(/[*_`]+/g, "")                           // bold / emphasis / code
@@ -1685,6 +2673,27 @@
 
     var whole = String(text || "").trim();
     var byName = matchSection(fileName);
+    if (byName) {
+      // The file NAME says which bucket this is (e.g. an exported
+      // "2_Objective.md"). Its content is that bucket's text: bold labels
+      // ("**FAQs:**"), "Objective:" lines, bullets and sub-headings that happen
+      // to name another bucket are content. Only real "#" headings naming at
+      // least two different buckets at the top heading level make it a
+      // combined file that is split.
+      var mdB = cands.filter(function (c) { return c.level > 0 && c.key !== "main-prompt"; });
+      var topL = mdB.length ? Math.min.apply(null, mdB.map(function (c) { return c.level; })) : 0;
+      var top = mdB.filter(function (c) { return c.level === topL; });
+      var dk = {}; top.forEach(function (c) { dk[c.key] = 1; });
+      if (Object.keys(dk).length < 2) {
+        var bodyN = whole;
+        if (top.length && top[0].key === byName.key) {
+          var preN = lines.slice(0, top[0].line).join("\n").replace(/<!--[\s\S]*?-->/g, "").trim();
+          if (!preN) bodyN = lines.slice(top[0].line + 1).join("\n").trim();   // drop its own title line
+        }
+        return { mode: "single", matched: [{ sec: byName, file: { name: byName.filename, text: bodyN } }], notes: [] };
+      }
+      heads = top;
+    }
     var distinctAll = {}; heads.forEach(function (c) { distinctAll[c.key] = 1; });
     var nDistinct = Object.keys(distinctAll).length;
     // A file named after one bucket goes WHOLE into that bucket unless it is
@@ -1725,47 +2734,6 @@
     return { mode: matched.length > 1 ? "multi" : "single", matched: matched, notes: notes };
   }
 
-  // Build a renderImportPlan-shaped plan from a list of matches.
-  function planFromMatched(matched) {
-    var seen = {};
-    matched.forEach(function (m) { seen[m.sec.key] = true; });
-    var missing = window.PPExtract.SECTIONS
-      .filter(function (s) { return !seen[s.key]; })
-      .map(function (s) { return s.title; });
-    return { matched: matched, unmatched: [], missing: missing };
-  }
-
-  // Pick a single .md (or .markdown / .txt) file and hand back its text + name.
-  function openSingleMdPicker(onText) {
-    var input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".md,.markdown,.txt,text/markdown,text/plain";
-    input.style.display = "none";
-    document.body.appendChild(input);
-    input.addEventListener("change", function () {
-      var file = input.files && input.files[0];
-      document.body.removeChild(input);
-      if (!file) return;
-      var reader = file.text ? file.text() : new Promise(function (res, rej) {
-        var fr = new FileReader();
-        fr.onload = function () { res(fr.result); };
-        fr.onerror = rej;
-        fr.readAsText(file);
-      });
-      Promise.resolve(reader)
-        .then(function (txt) { onText(String(txt || ""), file.name); })
-        .catch(function () { onText("", file.name); });
-    });
-    input.click();
-  }
-
-  function startImportMd() {
-    openSingleMdPicker(function (text, fileName) {
-      if (!text || !text.trim()) { ++opGen; renderImportPlan({ error: "That file was empty." }, null); return; }
-      beginImport(sourceFromMd(text, fileName));
-    });
-  }
-
   // No recognizable headings and the filename didn't match a bucket — let the
   // user say which bucket this file belongs to.
   function renderMdTargetPicker(text, fileName) {
@@ -1799,7 +2767,7 @@
       if (key === "main-prompt") src.mainWhole = true;
       beginImport(src);
     });
-    var cancel = mkBtn("Cancel", secondaryBtn(), function () { closePanel(); });
+    var cancel = mkBtn("Cancel", secondaryBtn(), function () { renderImportHome(); });
     row.appendChild(go); row.appendChild(cancel);
     footer().appendChild(row);
     setTimeout(function () { try { group.querySelector("input:checked").focus(); } catch (e) {} }, 50);
@@ -1815,16 +2783,21 @@
     s = s.replace(/[ \t]+$/gm, "");
     // Lines only: blank lines (paragraph vs line-break, loose vs tight lists) don't count.
     if (isTwoField()) s = s.replace(/\n{2,}/g, "\n");
+    // Older and newer exports escape differently ("snake\_case" vs "snake_case",
+    // "<b>" vs "\<b>"); the same text must compare equal either way.
+    s = s.replace(/([\p{L}\p{N}])\\_(?=[\p{L}\p{N}])/gu, "$1_").replace(/\\</g, "<");
     return s.replace(/\n+$/, "");
   }
 
   function coarseDiff(a, b) {
-    var mapA = {}, mapB = {}, i;
-    for (i = 0; i < a.length; i++) mapA[a[i]] = (mapA[a[i]] || 0) + 1;
-    for (i = 0; i < b.length; i++) mapB[b[i]] = (mapB[b[i]] || 0) + 1;
-    var add = 0, del = 0, k;
-    for (k in mapB) if (mapB.hasOwnProperty(k)) { var da = mapB[k] - (mapA[k] || 0); if (da > 0) add += da; }
-    for (k in mapA) if (mapA.hasOwnProperty(k)) { var dd = mapA[k] - (mapB[k] || 0); if (dd > 0) del += dd; }
+    // A Map: a line that reads "hasOwnProperty", "constructor" or "__proto__"
+    // is just a line (a plain object would treat those as its own members).
+    var mapA = new Map(), mapB = new Map(), i;
+    for (i = 0; i < a.length; i++) mapA.set(a[i], (mapA.get(a[i]) || 0) + 1);
+    for (i = 0; i < b.length; i++) mapB.set(b[i], (mapB.get(b[i]) || 0) + 1);
+    var add = 0, del = 0;
+    mapB.forEach(function (nb, k) { var da = nb - (mapA.get(k) || 0); if (da > 0) add += da; });
+    mapA.forEach(function (na, k) { var dd = na - (mapB.get(k) || 0); if (dd > 0) del += dd; });
     return { add: add, del: del, ops: null, coarse: true };
   }
 
@@ -1956,26 +2929,109 @@
   // Highlight matches on the page (non-destructive, via CSS Highlight API).
   var MENTION_SEL = '[data-type="mention"], .node-mention, .mention';
 
-  // Replace inside an editor's own copied HTML, text node by text node — the
-  // same text Find searches — never inside variable chips and never across
+  // ---- shared text matcher (Find, Replace, highlights) ----
+  // Text is matched per BLOCK (paragraph, list item, cell, heading…) on the
+  // concatenated text of its text nodes, so a match / whole-word check sees
+  // across formatting ("<b>Pay</b>ment" is one word). Variable chips and
+  // line breaks are boundaries (never matched, never part of a word), and
+  // plain-text references (@{{x}}, @((x)), @||x||) are masked exactly like
+  // applyReplace() treats them — Find and Replace never touch them.
+  var PLAIN_TOKEN_RE = /@(?:\{\{[^{}]+\}\}|\(\([^()]+\)\)|\|\|[^|]+\|\|)/g;
+  var FIND_INLINE_TAGS = { STRONG: 1, B: 1, EM: 1, I: 1, U: 1, S: 1, DEL: 1, STRIKE: 1, INS: 1, A: 1, SPAN: 1, CODE: 1,
+    MARK: 1, SUB: 1, SUP: 1, SMALL: 1, FONT: 1, ABBR: 1, Q: 1, CITE: 1, KBD: 1, VAR: 1, SAMP: 1, TIME: 1, DATA: 1, BDI: 1, BDO: 1, LABEL: 1 };
+  var SKIP_TAGS = { SCRIPT: 1, STYLE: 1, TEMPLATE: 1, TEXTAREA: 1, INPUT: 1, SELECT: 1, NOSCRIPT: 1 };
+  var BOUNDARY = "\uFFFC";
+  function textBlocks(root) {
+    var groups = [], cur = null;
+    function visit(n) {
+      if (n.nodeType === 3) {
+        if (!n.nodeValue) return;
+        if (!cur) { cur = { text: "", parts: [] }; groups.push(cur); }
+        cur.parts.push({ node: n, start: cur.text.length });
+        cur.text += n.nodeValue;
+        return;
+      }
+      if (n.nodeType !== 1) return;
+      if (SKIP_TAGS[n.nodeName]) return;
+      if (n.matches && n.matches(MENTION_SEL)) { if (cur) cur.text += BOUNDARY; return; }   // chip: a boundary, never searched
+      if (n.nodeName === "BR" || n.nodeName === "IMG" || n.nodeName === "HR") { if (cur) cur.text += BOUNDARY; return; }
+      var block = !FIND_INLINE_TAGS[n.nodeName];
+      if (block) cur = null;
+      for (var c = n.firstChild; c; c = c.nextSibling) visit(c);
+      if (block) cur = null;
+    }
+    for (var c = root.firstChild; c; c = c.nextSibling) visit(c);
+    return groups;
+  }
+  function maskTokens(text) {
+    return text.replace(PLAIN_TOKEN_RE, function (t) { return t.replace(/[\s\S]/g, BOUNDARY); });
+  }
+  // [{start, end}] matches in one block's text.
+  function blockMatches(text, query, opts) {
+    var re = findRegex(query, opts), masked = maskTokens(text), out = [], mm;
+    while ((mm = re.exec(masked))) {
+      if (mm[0].length === 0) { re.lastIndex++; continue; }
+      out.push({ start: mm.index, end: mm.index + mm[0].length });
+    }
+    return out;
+  }
+  // Group offset → { node, offset } (end positions bind to the earlier node).
+  function partAt(g, pos, isEnd) {
+    for (var i = 0; i < g.parts.length; i++) {
+      var p = g.parts[i], len = p.node.nodeValue.length;
+      if (pos >= p.start && (isEnd ? pos <= p.start + len : pos < p.start + len)) return { node: p.node, offset: pos - p.start };
+    }
+    return null;
+  }
+  // Rewrite matches (last first, so earlier offsets stay valid): the
+  // replacement goes into the node where the match starts; the rest of a match
+  // that spans formatting is removed from the following nodes.
+  function replaceInBlocks(groups, query, repl, opts) {
+    var count = 0;
+    groups.forEach(function (g) {
+      var ms = blockMatches(g.text, query, opts);
+      count += ms.length;
+      for (var k = ms.length - 1; k >= 0; k--) {
+        var s0 = ms[k].start, e0 = ms[k].end, first = true;
+        g.parts.forEach(function (p) {
+          var v = p.node.nodeValue, ps = p.start, pe = p.start + v.length;
+          if (pe <= s0 || ps >= e0) return;
+          var a = Math.max(s0, ps) - ps, b = Math.min(e0, pe) - ps;
+          if (first && ps <= s0) { p.node.nodeValue = v.slice(0, a) + repl + v.slice(b); first = false; }
+          else p.node.nodeValue = v.slice(0, a) + v.slice(b);
+        });
+      }
+    });
+    return count;
+  }
+
+  // Replace inside an editor's own copied HTML — the same text Find searches —
+  // never inside variable chips or plain-text references, and never across
   // markdown syntax (so "[END CALL]", "#", "|" or "*" behave like plain text).
   function replaceInHtml(html, query, replacement, opts) {
     var doc = new DOMParser().parseFromString("<div id='__rr'>" + String(html || "") + "</div>", "text/html");
     var root = doc.getElementById("__rr");
-    var walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null), node, nodes = [];
-    while ((node = walker.nextNode())) nodes.push(node);
-    var count = 0, repl = String(replacement == null ? "" : replacement);
-    nodes.forEach(function (n) {
-      if (n.parentElement && n.parentElement.closest(MENTION_SEL)) return;
-      var hits = (n.nodeValue.match(findRegex(query, opts)) || []).length;
-      if (!hits) return;
-      count += hits;
-      n.nodeValue = n.nodeValue.replace(findRegex(query, opts), function () { return repl; });
-    });
+    var count = replaceInBlocks(textBlocks(root), query, String(replacement == null ? "" : replacement), opts);
     return { html: root.innerHTML, count: count };
   }
 
+  // New layout, another section open: live typing never switches sections
+  // (res.offPrompt); an explicit Find (opts.navigate) searches on the Prompt
+  // section and comes back — the counts stay, the highlights can't.
   async function findAll(query, opts) {
+    if (query && d2OffPrompt()) {
+      clearHighlights();
+      var off = { total: 0, per: [], supported: !!(window.CSS && CSS.highlights && window.Highlight), offPrompt: true };
+      if (!(opts && opts.navigate)) return off;
+      var r = await d2OnPromptSection(function () { return findAllHere(query, opts); }, "export");
+      clearHighlights();   // painted on the Prompt section, which is closed again
+      if (!r.ok) { off.notOpened = r.why; return off; }
+      r.value.offPrompt = true; r.value.searched = true;
+      return r.value;
+    }
+    return findAllHere(query, opts);
+  }
+  async function findAllHere(query, opts) {
     clearHighlights();
     ensureHighlightStyle();
     var res = { total: 0, per: [], supported: !!(window.CSS && CSS.highlights && window.Highlight) };
@@ -1983,37 +3039,37 @@
     await openCollapsedForFind();
     var map = findEditors();
 
-    var ranges = [];
+    var ranges = [], fieldOnly = 0;
     for (var s = 0; s < map.length; s++) {
       var host = editorHost(map[s].el);
       if (!host) continue;
       var count = 0;
-      var re = findRegex(query, opts);
-      var walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, null);
-      var node;
-      while ((node = walker.nextNode())) {
-        var text = node.nodeValue;
-        if (!text) continue;
-        // Variable chips are not prompt text (Dash5 shows a friendly label like
-        // "Callee Name"); never count them, so Find agrees with Replace.
-        if (node.parentElement && node.parentElement.closest(MENTION_SEL)) continue;
-        re.lastIndex = 0;
-        var mm;
-        while ((mm = re.exec(text))) {
-          if (mm[0].length === 0) { re.lastIndex++; continue; }
-          try {
-            var r = document.createRange();
-            r.setStart(node, mm.index);
-            r.setEnd(node, mm.index + mm[0].length);
-            ranges.push(r);
-            count++;
-          } catch (e) {}
-        }
+      if (host.tagName === "TEXTAREA" || host.tagName === "INPUT") {
+        // A form field: search its LIVE value (its child text is only the
+        // default). The CSS highlight can't paint inside a field, so these
+        // matches are counted but not highlighted.
+        count = applyReplace(host.value || "", query, "", opts).count;
+        fieldOnly += count;
+      } else {
+        textBlocks(host).forEach(function (g) {
+          blockMatches(g.text, query, opts).forEach(function (m) {
+            var a = partAt(g, m.start, false), b = partAt(g, m.end, true);
+            if (!a || !b) return;
+            try {
+              var r = document.createRange();
+              r.setStart(a.node, a.offset);
+              r.setEnd(b.node, b.offset);
+              ranges.push(r);
+              count++;
+            } catch (e) {}
+          });
+        });
       }
       if (count) res.per.push({ title: map[s].title, count: count });
     }
 
-    res.total = ranges.length;
+    res.total = ranges.length + fieldOnly;
+    if (fieldOnly) res.unpainted = fieldOnly;
     _findRanges = ranges;
     _findIdx = ranges.length ? 0 : -1;
     if (res.supported && ranges.length) {
@@ -2051,7 +3107,17 @@
     return { text: out, count: count };
   }
 
+  // New layout, another section open: replace on the Prompt section (the edit
+  // stays pending in the page-wide save bar), then come back.
   async function replaceAllBuckets(query, replacement, opts) {
+    if (d2OffPrompt()) {
+      var r = await d2OnPromptSection(function () { return replaceAllHere(query, replacement, opts); }, "replace");
+      if (r.ok) return r.value;
+      var none = []; none.notOpened = r.why; return none;
+    }
+    return replaceAllHere(query, replacement, opts);
+  }
+  async function replaceAllHere(query, replacement, opts) {
     await openCollapsedForFind();
     var map = findEditors();
 
@@ -2072,7 +3138,7 @@
           var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
           setter.call(m.el, rep0.text);
           m.el.dispatchEvent(new Event("input", { bubbles: true }));
-          results.push({ title: m.title, n: rep0.count, ok: true });
+          results.push({ title: m.title, n: rep0.count, ok: true, undo: { el: m.el, key: m.key, value: md, after: rep0.text } });
         } catch (e) { results.push({ title: m.title, n: rep0.count, ok: false }); }
       } else {
         var cap = await copyEditor(m.el);
@@ -2087,17 +3153,74 @@
           count = rep.count; outHtml = mdToHydratedHtml(rep.text);
         }
         if (!count) continue;
+        // What the field held before, so the panel can undo the replace (the
+        // editor's own Ctrl+Z does not reliably revert a scripted paste).
+        var beforeHtml = cap.html ? collapseStructuralWhitespace(sanitizeHtml(cap.html)) : mdToHydratedHtml(cap.text || "");
+        // New layout: a field emptied by the replace can't be stored — left as is.
+        if (d2NewUi() && isTwoField() && !htmlToText(outHtml).replace(/\s+/g, "")) {
+          results.push({ title: m.title, n: count, ok: false, warn: V2_NO_CLEAR, undo: null });
+          continue;
+        }
         var ok = await pasteHtmlIntoEditor(m.el, outHtml);
-        var rr = { title: m.title, n: count, ok: ok };
+        var rr = { title: m.title, n: count, ok: ok, undo: ok ? { el: m.el, key: m.key, html: beforeHtml } : null };
         // The page's editor may turn * _ ~ ` in the replacement into formatting — say so.
         if (ok) { var dr = pasteDrift(outHtml, m.el); if (dr) rr.warn = dr; }
+        if (ok) { var tw2 = v2TableSaveWarning(m.el); if (tw2) rr.warn = (rr.warn ? rr.warn + "; " : "") + tw2; }
         results.push(rr);
       }
       await sleep(150);
     }
 
     try { if (prevClip) await navigator.clipboard.writeText(prevClip); } catch (e) {}
+    // What each field holds right after the replace — Undo checks it, so text
+    // the user typed afterwards is never silently thrown away.
+    results.forEach(function (r) { if (r.undo && typeof r.undo.value !== "string") r.undo.after = fieldSignature(r.undo.el); });
     return results;
+  }
+
+  // A rich editor's content, for "did the user edit it since?": its text plus
+  // the variables its chips hold (selection / highlight state doesn't count).
+  function fieldSignature(el) {
+    var host = editorHost(el);
+    if (!host) return "";
+    if (host.tagName === "TEXTAREA" || host.tagName === "INPUT") return host.value || "";
+    var ids = [].map.call(host.querySelectorAll(MENTION_SEL), function (c) { return c.getAttribute("data-id") || c.textContent; });
+    return (host.textContent || "") + "\u0001" + ids.join("\u0002");
+  }
+
+  // Put back what replaceAllBuckets() changed, field by field. A field that
+  // changed after the replace is skipped (changed: true) — never overwritten.
+  // An editor the page re-mounted (e.g. the user left the section and came
+  // back) is found again by its field key; its content check below still applies.
+  async function undoReplaceAll(results) {
+    if (d2OffPrompt() && results.some(function (r) { return r.undo && r.undo.el && !r.undo.el.isConnected; })) {
+      var r = await d2OnPromptSection(function () { return undoReplaceHere(results); }, "replace");
+      if (r.ok) return r.value;
+    }
+    return undoReplaceHere(results);
+  }
+  async function undoReplaceHere(results) {
+    var out = [];
+    for (var i = 0; i < results.length; i++) {
+      var u = results[i].undo;
+      if (u && u.el && !u.el.isConnected && u.key) {
+        var re = findEditors().filter(function (x) { return x.key === u.key && x.el; })[0];
+        if (re) u.el = re.el;
+      }
+      if (!u || !u.el || !u.el.isConnected) { if (results[i].ok) out.push({ title: results[i].title, ok: false }); continue; }
+      var now = typeof u.value === "string" ? (u.el.value || "") : fieldSignature(u.el);
+      if (typeof u.after === "string" && now !== u.after) { out.push({ title: results[i].title, ok: false, changed: true }); continue; }
+      var ok = false;
+      try {
+        if (typeof u.value === "string") {
+          var setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(u.el), "value").set;
+          setter.call(u.el, u.value); u.el.dispatchEvent(new Event("input", { bubbles: true })); ok = true;
+        } else ok = await pasteHtmlIntoEditor(u.el, u.html);
+      } catch (e) { ok = false; }
+      out.push({ title: results[i].title, ok: ok });
+      await sleep(120);
+    }
+    return out;
   }
 
   // ---- v2 UI (Shadow-DOM design system) -----------------------------------
@@ -2116,30 +3239,40 @@
 .rs-tab,.rs-btn,.rs-launcher,.rs-iconbtn,.rs-x{text-align:center}
 .rs-panel button,.rs-panel input,.rs-panel select{font-family:var(--rs-font)}
 /* ---- launcher ---- */
-.rs-launcher{position:fixed;right:22px;bottom:22px;z-index:2147483646;display:inline-flex;align-items:center;gap:10px;
-  min-height:52px;box-sizing:border-box;padding:8px 16px;border:2px solid var(--ink);border-radius:var(--sk2);cursor:pointer;
-  color:var(--white);background:var(--ink);box-shadow:3px 4px 0 var(--steel);font-size:14px;font-weight:bold;
+.rs-launcher{position:fixed;right:22px;bottom:22px;z-index:2147483647;display:inline-flex;align-items:center;gap:12px;
+  min-height:62px;min-width:94px;justify-content:center;box-sizing:border-box;padding:10px 24px;border:2px solid var(--ink);border-radius:3px;cursor:pointer;
+  color:var(--white);background:var(--ink);box-shadow:4px 5px 0 var(--steel);font-size:17px;font-weight:bold;
   transition:transform var(--rs-dur) var(--rs-ease),box-shadow var(--rs-dur) var(--rs-ease)}
-.rs-launcher:hover{transform:translate(-1px,-1px);box-shadow:4px 5px 0 var(--steel)}
+.rs-ver{position:absolute;left:5px;top:4px;font-size:9px;line-height:1;font-weight:700;letter-spacing:.02em;opacity:.85;pointer-events:none}
+.rs-launcher:hover{transform:translate(-1px,-1px);box-shadow:5px 6px 0 var(--steel)}
 .rs-launcher:active{transform:translate(1px,1px);box-shadow:2px 2px 0 var(--steel)}
-.rs-launcher.rs-tucked{transform:translateX(calc(100% - 12px))}
-.rs-launcher.rs-tucked:hover{transform:translateX(calc(100% - 44px))}
-.rs-star{width:18px;height:18px;flex:none;display:block}
+.rs-launcher.rs-tucked{transform:translateX(calc(100% - 14px))}
+.rs-launcher.rs-tucked:hover{transform:translateX(calc(100% - 53px))}
+.rs-star{width:22px;height:22px;flex:none;display:block}
+.rs-launcher .rs-badge{border-radius:2px;padding:1px 10px;font-size:14px;line-height:24px}
 .rs-badge{background:var(--white);color:var(--ink);border-radius:var(--sk);padding:1px 8px;font-size:12px;line-height:20px}
 .rs-badge:empty{display:none}
+.rs-launcher.rs-tucked .rs-badge{display:none}
+.rs-launcher .rs-badge{animation:rs-badge-in .32s cubic-bezier(.34,1.56,.64,1)}
+@keyframes rs-badge-in{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:none}}
 /* ---- panel shell ---- */
-.rs-panel{position:fixed;right:22px;bottom:90px;z-index:2147483647;width:392px;max-width:calc(100vw - 32px);
-  max-height:min(780px,calc(100vh - 108px));display:flex;flex-direction:column;box-sizing:border-box;
+.rs-panel{position:fixed;right:22px;bottom:100px;z-index:2147483647;width:392px;max-width:calc(100% - 32px);
+  max-height:min(780px,calc(100vh - 118px));display:flex;flex-direction:column;box-sizing:border-box;
   background:var(--white);border:2px solid var(--ink);border-radius:22px 9px 20px 11px/11px 20px 9px 22px;box-shadow:5px 6px 0 var(--ink);
   font-size:13px;line-height:1.45;transform-origin:bottom right}
+/* another PromptPort build in the same corner: launcher above its launcher, panel
+   beside its panel (or above both launchers when the window is too narrow) */
+:host([data-pp-coexist]) .rs-launcher{bottom:96px}
+:host([data-pp-coexist]) .rs-panel{bottom:174px;max-height:min(780px,calc(100vh - 192px))}
 .rs-panel.rs-enter{animation:rs-in .24s var(--rs-ease)}
+.rs-panel.rs-swap{overflow-x:clip}
 @keyframes rs-in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
 .rs-top{flex:none}
 .rs-phead{display:flex;align-items:center;gap:8px;padding:6px 8px 0 18px;min-height:44px}
 .rs-trust{flex:1;min-width:0;display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--steel)}
 .rs-trust svg{flex:none}
 .rs-trust-t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rs-links{display:flex;gap:6px;align-items:center}
+.rs-links{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-width:0}
 .rs-links[hidden]{display:none}
 .rs-links:not([hidden]){animation:rs-pop .35s var(--rs-ease)}
 @keyframes rs-pop{from{opacity:0;transform:translateY(-4px) scale(.9)}to{opacity:1;transform:none}}
@@ -2158,13 +3291,14 @@
 .rs-body{flex:1 1 auto;min-height:0;padding:16px 18px;overflow-y:auto;overscroll-behavior:contain}
 .rs-body>:first-child{margin-top:0}
 .rs-body>:last-child{margin-bottom:0}
+.rs-body.rs-more{-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 26px),transparent);mask-image:linear-gradient(to bottom,#000 calc(100% - 26px),transparent)}
 .rs-foot{flex:none;padding:14px 18px 14px;border-top:2px dashed var(--ash);background:var(--white);border-radius:0 0 18px 9px}
 .rs-foot:empty{display:none}
 .rs-foot>:first-child{margin-top:0}
 /* ---- text ---- */
 .rs-note,.rs-muted{color:var(--graphite);font-size:12.5px;line-height:1.55;margin:10px 0}
 .rs-muted{font-size:11.5px;color:var(--steel)}
-.rs-lead{font-size:13px;line-height:1.55;margin:0 0 12px}
+.rs-lead{font-size:13px;line-height:1.55;margin:0 0 12px;min-width:0;overflow-wrap:anywhere}
 .rs-done-line b{color:var(--ink)}
 .rs-introw{display:flex;gap:12px;align-items:flex-start}
 .rs-introw svg{flex:none}
@@ -2175,7 +3309,7 @@
 .rs-card.rs-empty{border-style:dashed;background:var(--paper)}
 .rs-ic{width:24px;height:24px;flex:none;display:grid;place-items:center}
 .rs-grow{flex:1;min-width:0}
-.rs-cname{font-weight:bold;font-size:13px}
+.rs-cname{font-weight:bold;font-size:13px;overflow-wrap:anywhere}
 .rs-cmeta{font-size:11.5px;color:var(--steel);text-align:right;flex:none}
 .rs-card.rs-empty .rs-cmeta{color:var(--graphite);font-weight:bold;max-width:58%}
 .rs-count{font-variant-numeric:tabular-nums}
@@ -2196,11 +3330,11 @@
 .rs-btn-primary:hover,.rs-btn-danger:hover{box-shadow:4px 4px 0 var(--steel)}
 .rs-btn-ghost{background:var(--white);color:var(--ink)}
 .rs-btn-ghost:hover{background:var(--mist)}
-.rs-btn:disabled{background:var(--white) var(--hatch);color:var(--graphite);border-style:dashed;border-color:var(--steel);box-shadow:none;cursor:not-allowed;transform:none}
+.rs-btn:disabled,.rs-btn[aria-disabled="true"]{background:var(--white) var(--hatch);color:var(--graphite);border-style:dashed;border-color:var(--steel);box-shadow:none;cursor:not-allowed;transform:none}
 .rs-row.rs-three{display:grid;grid-template-columns:1fr 1.35fr 1fr;gap:10px}
 .rs-btn svg{width:auto}
 .rs-ctas{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.rs-cta.rs-cta-wide{display:flex;width:100%;margin-top:12px;flex-direction:row;align-items:center;justify-content:center;gap:8px;min-height:0;height:36px;padding:0 14px}
+.rs-cta.rs-cta-wide{display:flex;width:100%;margin-top:12px;flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:center;gap:0 8px;min-height:36px;height:auto;padding:3px 14px}
 .rs-cta.rs-cta-wide svg{width:24px;height:19px;flex:none}
 .rs-cta{flex-direction:column;gap:4px;padding:12px 8px 10px;min-height:126px;background:var(--mist);color:var(--ink);box-shadow:3px 3px 0 var(--ink);font-size:13px}
 .rs-cta:nth-child(even){border-radius:var(--sk2)}
@@ -2216,6 +3350,7 @@
 /* ---- callouts ---- */
 .rs-callout{display:flex;gap:10px;align-items:flex-start;border:2px solid var(--ink);border-radius:var(--sk2);padding:9px 12px;font-size:12.5px;line-height:1.5;margin:10px 0;background:var(--paper)}
 .rs-callout svg{flex:none;margin-top:1px}
+.rs-callout>div{min-width:0;overflow-wrap:anywhere}
 .rs-callout.ok{border-radius:var(--sk)}
 .rs-callout.bad{background:var(--white);border-width:2.5px}
 .rs-callout b{font-weight:bold}
@@ -2269,12 +3404,12 @@
 .rs-line-dot.bullet{width:10px;height:10px;background:var(--ink)}
 .rs-line-dot.bullet.alt{background:var(--white);border:2px solid var(--ink)}
 .rs-line-body{flex:1;min-width:0}
-.rs-line-label{font-weight:bold;font-size:13px}
-.rs-line-meta{color:var(--steel);font-size:11.5px;text-align:right;max-width:58%;line-height:1.4}
-.rs-line-sub{font-size:11.5px;color:var(--graphite);line-height:1.45}
+.rs-line-label{font-weight:bold;font-size:13px;overflow-wrap:anywhere}
+.rs-line-meta{color:var(--steel);font-size:11.5px;text-align:right;max-width:58%;line-height:1.4;overflow-wrap:anywhere}
+.rs-line-sub{font-size:11.5px;color:var(--graphite);line-height:1.45;overflow-wrap:anywhere}
 .rs-line.skip .rs-line-label{color:var(--graphite)}
 .rs-donehead{display:flex;align-items:center;gap:12px;margin-bottom:6px}
-.rs-donehead-t{font-size:15px;font-weight:bold;line-height:1.25}
+.rs-donehead-t{font-size:15px;font-weight:bold;line-height:1.25;overflow-wrap:anywhere}
 .rs-donehead-s{font-size:11.5px;color:var(--graphite)}
 .rs-choices{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 0;border:none;padding:0}
 .rs-choice{display:flex;align-items:center;gap:8px;font-size:12px;padding:7px 10px;min-height:40px;box-sizing:border-box;border:2px solid var(--ink);border-radius:var(--sk);background:var(--white);cursor:pointer}
@@ -2311,19 +3446,21 @@
 .rs-result-h .rs-hl{background:var(--mist);padding:1px 5px;border-radius:4px}
 .rs-result-empty{color:var(--graphite);margin:12px 0 0;font-size:12.5px}
 /* ---- toasts ---- */
-.rs-toasts{position:fixed;right:22px;bottom:84px;max-width:calc(100vw - 44px);z-index:2147483647;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.rs-toasts{position:fixed;right:22px;bottom:94px;max-width:calc(100vw - 44px);z-index:2147483647;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
 .rs-toast{display:flex;align-items:center;gap:9px;line-height:1.4;background:var(--white);border:2px solid var(--ink);border-radius:var(--sk2);
-  padding:8px 13px;box-shadow:3px 3px 0 var(--ink);font-size:12px;font-weight:bold;color:var(--ink);animation:rs-toast-in .3s var(--rs-ease)}
+  padding:8px 13px;box-shadow:3px 3px 0 var(--ink);font-size:12px;font-weight:bold;color:var(--ink);animation:rs-toast-in .3s var(--rs-ease);box-sizing:border-box;min-height:62px}
 @keyframes rs-toast-in{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
 .rs-tic{width:20px;height:20px;flex:none;display:block}
 .rs-undo{margin-left:4px;cursor:pointer;font-weight:bold;text-decoration:underline}
 /* ---- a11y + small windows ---- */
 .rs-launcher:focus-visible,.rs-x:focus-visible,.rs-tab:focus-visible,.rs-btn:focus-visible,.rs-textbtn:focus-visible,.rs-iconbtn:focus-visible,
 .rs-dropzone:focus-visible,.rs-view-changes:focus-visible,.rs-linkic:focus-visible,.rs-check:focus-within,.rs-choice:focus-within{outline:2px solid var(--ink);outline-offset:2px}
-.rs-tab:focus-visible{outline-offset:-2px}
+.rs-tab:focus-visible{outline-offset:2px;border-radius:var(--sk)}
 @media (max-height:620px){.rs-trust-t{display:none}.rs-cta{min-height:96px}.rs-cta svg{width:44px;height:34px}}
-@media (max-height:560px){.rs-cta:not(.rs-cta-wide){min-height:76px;padding:8px 6px 7px;gap:2px}.rs-cta:not(.rs-cta-wide) svg{width:32px;height:25px}.rs-cta.rs-cta-wide{height:32px;margin-top:8px}}
-@media (max-height:480px){.rs-phead{min-height:34px;padding-top:2px}.rs-x{width:36px;height:36px}.rs-tab{min-height:34px;padding:6px 4px 8px}.rs-foot{padding:9px 14px 9px}.rs-cta:not(.rs-cta-wide){min-height:48px;padding:6px 6px}.rs-cta:not(.rs-cta-wide) svg{display:none}.rs-cta.rs-cta-wide{height:30px;margin-top:6px}.rs-foot-meta{margin-top:2px}}
+@media (max-height:560px){.rs-cta:not(.rs-cta-wide){min-height:76px;padding:8px 6px 7px;gap:2px}.rs-cta:not(.rs-cta-wide) svg{width:32px;height:25px}.rs-cta.rs-cta-wide{min-height:32px;margin-top:8px}}
+@media (max-height:560px){.rs-panel{overflow-y:auto;overscroll-behavior:contain}.rs-panel>.rs-body{flex:none;overflow:visible}.rs-panel>.rs-foot{position:sticky;bottom:0;z-index:1}.rs-panel.rs-foot-free>.rs-foot{position:static}}
+@media (max-height:420px){.rs-panel .rs-foot{padding-top:7px;padding-bottom:7px}.rs-cta:not(.rs-cta-wide){min-height:40px}.rs-cta:not(.rs-cta-wide)::after{display:none}.rs-foot-meta .rs-textbtn{min-height:28px;padding:2px 8px}}
+@media (max-height:480px){.rs-phead{min-height:34px;padding-top:2px}.rs-x{width:36px;height:36px}.rs-tab{min-height:34px;padding:6px 4px 8px}.rs-foot{padding:9px 14px 9px}.rs-cta:not(.rs-cta-wide){min-height:48px;padding:6px 6px}.rs-cta:not(.rs-cta-wide) svg{display:none}.rs-cta.rs-cta-wide{min-height:30px;margin-top:6px}.rs-foot-meta{margin-top:2px}}
 /* ---- motion system: paper, ink and springs (all off under reduced-motion) ---- */
 :host{--rs-spring:cubic-bezier(.34,1.56,.64,1);--rs-out:cubic-bezier(.16,1,.3,1)}
 @keyframes rs-in{0%{opacity:0;transform:translate(22px,34px) scale(.8) rotate(3.5deg)}55%{opacity:1;transform:translate(-2px,-4px) scale(1.018) rotate(-.7deg)}78%{transform:translate(1px,1px) scale(.996) rotate(.25deg)}100%{opacity:1;transform:none}}
@@ -2341,7 +3478,7 @@
 @keyframes rs-dive{0%,100%{transform:none}45%{transform:translateY(9px)}}
 @keyframes rs-spin{to{transform:rotate(360deg)}}
 @keyframes rs-squig-slide{from{transform:translateX(var(--rs-from,0)) scaleX(1.6)}to{transform:none}}
-@keyframes rs-hello{0%,100%{transform:none}20%{transform:rotate(-7deg) scale(1.06)}40%{transform:rotate(6deg) scale(1.06)}60%{transform:rotate(-3deg)}80%{transform:rotate(2deg)}}
+@keyframes rs-hello{0%,100%{transform:none}20%{transform:rotate(-4deg) scale(1.04)}40%{transform:rotate(3.5deg) scale(1.04)}60%{transform:rotate(-2deg)}80%{transform:rotate(1deg)}}
 @keyframes rs-hello-star{from{transform:none}to{transform:rotate(360deg) scale(1)}}
 @keyframes rs-timer{to{transform:scaleX(0)}}
 @keyframes rs-shine{from{transform:translateX(-120%) skewX(-20deg)}to{transform:translateX(220%) skewX(-20deg)}}
@@ -2433,6 +3570,8 @@
 .rs-mp-key-t{flex:none;font-weight:bold;white-space:nowrap}
 .rs-mp-key.flag{background:#fff7ed}.rs-mp-key.flag .rs-mp-key-t{color:#b45309}
 .rs-mp-consent:has(input:checked){border-color:#16a34a;background:#f0fdf4}
+.rs-mp-consent:has(input:disabled),.rs-mp-consent.rs-mp-consent-off{opacity:.55!important;border-style:dashed;animation:none}
+.rs-mp-consent:has(input:disabled) .rs-mp-consent-text,.rs-mp-consent-cb:disabled{cursor:not-allowed}
 .rs-mp-consent-cb:checked,.rs-check input:checked,.rs-choice input:checked{animation:rs-popin .45s var(--rs-out)}
 /* toasts: spring in with a tilt; a bar shows how long they stay */
 .rs-toast{position:relative;overflow:hidden;animation:rs-toast-in .55s var(--rs-spring)}
@@ -2470,7 +3609,11 @@
 .rs-port-spark.s2{animation-delay:.7s}
 .rs-working{display:inline-flex;align-items:center;gap:8px}
 .rs-working svg{flex:none;animation:rs-spin .9s linear infinite}
+@media (forced-colors:active){.rs-star path{fill:currentColor;stroke:currentColor}.rs-launcher .rs-badge{border:1px solid currentColor}
+  .rs-line-dot.ok,.rs-line-dot.bullet{forced-color-adjust:none;background:CanvasText;color:Canvas}.rs-line-dot.bullet.alt{background:Canvas;border-color:CanvasText}
+  .rs-btn:disabled,.rs-btn[aria-disabled="true"],.rs-cta:disabled{border-style:dashed;border-color:GrayText;color:GrayText}}
 @media (prefers-reduced-motion:reduce){:host *,:host *::before,:host *::after{animation:none!important;transition:none!important}.rs-drawp,.rs-squig path,.rs-smile circle,.rs-smile path{stroke-dashoffset:0!important}}
+.rs-view-changes{min-height:24px}
 `;
 
   var UI = { host: null, root: null, launcher: null, card: null, badge: null, links: null };
@@ -2497,6 +3640,7 @@
     up: '<svg width="13" height="9" viewBox="0 0 14 10" aria-hidden="true"><path d="M2 8l5-6 5 6" fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     down: '<svg width="13" height="9" viewBox="0 0 14 10" aria-hidden="true"><path d="M2 2l5 6 5-6" fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     spin: '<svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 1-7.3 5.8" fill="none" stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round"/></svg>',
+    pause: '<svg class="rs-pause-ic" width="16" height="16" viewBox="0 0 20 20" aria-hidden="true" style="animation:none"><path d="M7 4.5v11M13 4.5v11" fill="none" stroke="#1a1a1a" stroke-width="2.6" stroke-linecap="round"/></svg>',
     hx: '<svg width="11" height="11" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2l10 10M12 2L2 12" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/></svg>',
     hok: '<svg width="12" height="12" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7.5l3.5 3.5L12 3" fill="none" stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     // Author links — official LinkedIn / GitHub / Figma marks (Simple Icons, CC0), in greyscale.
@@ -2681,17 +3825,63 @@
     catch (e) { return false; }
   }
 
+  var PP_HOST_ID = "promptport-host-v41";
+  var PP_VERSION = (function () { try { return chrome.runtime.getManifest().version || "4.1.0"; } catch (e) { return "4.1.0"; } })();
+  // Another PromptPort build in the same browser (4.0's host is a
+  // div[id$="-studio-host"] under <body>; older ones used #promptport-host)
+  // sits in the same bottom-right corner: mark our host so the CSS moves this
+  // launcher above that one and the panel beside (or above) it. Re-checked
+  // when <body>'s direct children change (cheap: no subtree).
+  function ppOtherHost() {
+    try {
+      var kids = [].slice.call(document.body ? document.body.children : []).concat([].slice.call(document.documentElement.children));
+      return kids.some(function (h) {
+        return h !== UI.host && h.tagName === "DIV" && (/-studio-host$/.test(h.id || "") || h.id === "promptport-host");
+      });
+    } catch (e) { return false; }
+  }
+  function ppCoexistSync() {
+    try { if (UI.host) UI.host.toggleAttribute("data-pp-coexist", ppOtherHost()); } catch (e) {}
+  }
+  function ppCoexistWatch() {
+    ppCoexistSync();
+    var watched = null;
+    var watchBody = function () {
+      if (!document.body || document.body === watched) return;
+      watched = document.body;
+      try { new MutationObserver(ppCoexistSync).observe(watched, { childList: true }); } catch (e) {}
+      ppCoexistSync();
+    };
+    watchBody();
+    try { new MutationObserver(function () { watchBody(); ppCoexistSync(); }).observe(document.documentElement, { childList: true }); } catch (e) {}
+  }
   function ensureHost() {
-    if (UI.root) return UI.root;
+    // The page took our host out (and keepHost backed off for now): every use
+    // of the UI puts it back under <html>.
+    if (UI.root) {
+      try { if (UI.host && UI.host.parentNode !== document.documentElement && document.documentElement) document.documentElement.appendChild(UI.host); } catch (e) {}
+      return UI.root;
+    }
     var host = document.createElement("div");
-    host.id = "promptport-host";
+    // A distinct id and a version mark, so this build never shares (or fights
+    // over) the host of an older PromptPort installed in the same browser.
+    host.id = PP_HOST_ID;
+    try { host.setAttribute("data-pp-version", PP_VERSION); } catch (e) {}
     try { host.style.all = "initial"; } catch (e) {}
     var root = host.attachShadow({ mode: "open" });
     var st = document.createElement("style");
     st.textContent = RS_CSS;
     root.appendChild(st);
-    document.body.appendChild(host);
+    // Live under <html>, not <body>: a body with transform/filter/contain would
+    // otherwise become the containing block of our position:fixed UI.
+    (document.documentElement || document.body).appendChild(host);
     UI.host = host; UI.root = root;
+    keepHost(host);
+    syncZoom();
+    window.addEventListener("resize", syncZoom);
+    // A page zoom set on <html> without a resize (style / class change) too.
+    try { new MutationObserver(syncZoom).observe(document.documentElement, { attributes: true, attributeFilter: ["style", "class"] }); } catch (e) {}
+    ppCoexistWatch();
     root.addEventListener("pointerdown", function (e) {
       try {
         var t = e.target && e.target.closest && e.target.closest(".rs-btn,.rs-cta,.rs-tab,.rs-launcher,.rs-check,.rs-linkic,.rs-dropzone,.rs-textbtn,.rs-x,.rs-choice");
@@ -2700,7 +3890,60 @@
         FX.burst(e.clientX, e.clientY, null, t.classList.contains("rs-cta") || t.classList.contains("rs-btn-primary") ? 11 : 8);
       } catch (err) {}
     }, true);
+    // Busy lock: controls drawn while a job runs are disabled too, and a click /
+    // drop that still reaches one is stopped with a short explanation.
+    try {
+      new MutationObserver(function () { if (_ppBusy) ppPaintBusy(); }).observe(root, { childList: true, subtree: true });
+    } catch (e) {}
+    function busyStop(e) {
+      if (!_ppBusy) return;
+      // A file dragged onto the panel while busy is refused anywhere in it (and
+      // never falls through to the browser, which would open it and leave the page).
+      if (e.type === "dragover") { e.preventDefault(); e.stopPropagation(); try { e.dataTransfer.dropEffect = "none"; } catch (x) {} return; }
+      if (e.type === "drop") { e.preventDefault(); e.stopPropagation(); toast(ppBusyText(), null, "info"); return; }
+      var t = e.target && e.target.closest && e.target.closest("[data-pp-busy]");
+      if (!t) return;
+      e.preventDefault(); e.stopPropagation();
+      toast(ppBusyText(), null, "info");
+    }
+    ["click", "drop", "dragover"].forEach(function (ty) { root.addEventListener(ty, busyStop, true); });
     return root;
+  }
+
+  // Put the host back under <html> if the page removes or moves it. Bounded, so
+  // we never fight another script forever: only a removal that comes right
+  // after our own re-append (a script fighting us) counts, and after 50 of those
+  // in a row we back off for a while and then try once more. A page that just
+  // removes it now and then (e.g. on a route change) never uses the budget up.
+  var KEEP_FIGHT_MS = 250, KEEP_MAX = 50, KEEP_BACKOFF_MS = 30000;
+  function keepHost(host) {
+    try {
+      var n = 0, lastPut = 0, backoff = null;
+      var put = function () {
+        var de = document.documentElement;
+        if (!de || host.parentNode === de) return;
+        lastPut = Date.now(); de.appendChild(host);
+      };
+      new MutationObserver(function () {
+        var de = document.documentElement;
+        if (!de || host.parentNode === de) return;
+        if (Date.now() - lastPut > KEEP_FIGHT_MS) n = 0;   // not a fight: a fresh budget
+        if (n >= KEEP_MAX) {
+          if (!backoff) backoff = setTimeout(function () { backoff = null; n = 0; put(); }, KEEP_BACKOFF_MS);
+          return;
+        }
+        n++; put();
+      }).observe(document.documentElement, { childList: true });
+    } catch (e) {}
+  }
+  // Undo a page-level CSS zoom on <html> so the panel keeps its size and stays on-screen.
+  function syncZoom() {
+    try {
+      if (!UI.host) return;
+      var z = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
+      var want = z > 0 && Math.abs(z - 1) > 0.001 ? String(1 / z) : "";
+      if (UI.host.style.zoom !== want) UI.host.style.zoom = want;
+    } catch (e) {}
   }
 
   // Launcher pill (formerly the FAB).
@@ -2711,26 +3954,45 @@
   function tuckLauncher() {
     if (UI.launcher && !UI.card) UI.launcher.classList.add("rs-tucked");
   }
+  // The idle countdown never tucks it away from under keyboard focus or a resting mouse.
+  function autoTuck() {
+    try { if (UI.launcher && ((UI.root.activeElement === UI.launcher && UI.launcher.matches(":focus-visible")) || UI.launcher.matches(":hover"))) return; } catch (e) {}
+    tuckLauncher();
+  }
   function untuckLauncher() {
     if (UI.launcher) UI.launcher.classList.remove("rs-tucked");
   }
   function resetTuckTimer() {
     clearTimeout(_tuckTimer);
-    _tuckTimer = setTimeout(tuckLauncher, TUCK_MS);
+    _tuckTimer = setTimeout(autoTuck, TUCK_MS);
   }
 
   function ensureUI() {
     var root = ensureHost();
+    // The page took our host out (and keepHost gave up for now): put it back.
+    try { if (UI.host && !UI.host.isConnected && document.documentElement) document.documentElement.appendChild(UI.host); } catch (e) {}
     if (UI.launcher) return;
     var b = el("button", "rs-launcher");
-    b.innerHTML = IC.star + '<span class="rs-badge"></span>';
-    b.title = "PromptPort";
-    b.setAttribute("aria-label", "PromptPort");
+    b.innerHTML = IC.star + '<span class="rs-badge"></span><span class="rs-ver" aria-hidden="true">4.1</span>';
+    b.title = "PromptPort 4.1";
+    b.setAttribute("aria-label", "PromptPort 4.1");
     b.setAttribute("aria-expanded", "false");
     UI.badge = b.querySelector(".rs-badge");
+    var lastPtr = "", ptrAt = 0, kbDown = false;
+    b.addEventListener("pointerdown", function (e) { lastPtr = e.pointerType || ""; ptrAt = Date.now(); });
+    b.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") kbDown = true;
+      else if (b.classList.contains("rs-tucked")) { untuckLauncher(); clearTimeout(_tuckTimer); }   // any key while focused brings it out
+    });
     b.addEventListener("click", function (e) {
-      // First click on the tucked sliver just slides the full pill out.
-      if (b.classList.contains("rs-tucked")) { untuckLauncher(); resetTuckTimer(); return; }
+      var ptr = e.pointerType || lastPtr, kb = kbDown; lastPtr = ""; kbDown = false;
+      // First mouse click on the tucked sliver just slides the full pill out;
+      // a keyboard activation (focus already untucked it) or a tap opens at once.
+      if (b.classList.contains("rs-tucked")) {
+        var kbAct = kb && e.detail === 0;
+        untuckLauncher();
+        if (!kbAct && ptr !== "touch") { resetTuckTimer(); return; }
+      }
       if (UI.card) closePanel(e.detail === 0);
       else {
         openPanel();
@@ -2738,16 +4000,47 @@
       }
       resetTuckTimer();
     });
-    // Hovering the sliver peeks it out and keeps it awake.
-    b.addEventListener("mouseenter", function () { resetTuckTimer(); });
+    // Hovering or focusing keeps it out; the idle countdown restarts on leave.
+    b.addEventListener("mouseenter", function () { clearTimeout(_tuckTimer); });
+    b.addEventListener("mouseleave", function () { resetTuckTimer(); });
+    b.addEventListener("focus", function () { if (Date.now() - ptrAt > 500) untuckLauncher(); clearTimeout(_tuckTimer); });   // a press focuses it too: the click decides then
+    b.addEventListener("blur", function () { kbDown = false; if (!b.matches(":hover")) resetTuckTimer(); });
     root.appendChild(b);
     UI.launcher = b;
+    wireEscape(root);
+    // The toast live region exists before its first message, so it is announced.
+    if (!root.querySelector(".rs-toasts")) { var tw = el("div", "rs-toasts"); tw.setAttribute("role", "status"); tw.setAttribute("aria-live", "polite"); root.appendChild(tw); }
     FX.hello(b);
     resetTuckTimer(); // start the 7s countdown; it tucks if left idle
+    mpInterruptNotice();   // a migration on this bot was cut off by a reload / login redirect
+  }
+
+  // Escape closes the panel and returns focus to the launcher — from anywhere in
+  // the panel, and also when focus fell to the page's <body> from the panel
+  // (e.g. a control vanished). Keys typed in the page's own inputs/editors are
+  // never touched.
+  function wireEscape(root) {
+    var fromPanel = false;
+    root.addEventListener("focusin", function () { fromPanel = true; });
+    root.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape" || !UI.card || e.defaultPrevented) return;
+      e.preventDefault(); e.stopPropagation(); if (!mpAckBlocks()) closePanel(true);
+    });
+    document.addEventListener("focusin", function (e) { if (e.target !== UI.host && e.isTrusted) fromPanel = false; }, true);
+    document.addEventListener("pointerdown", function (e) { if (e.target !== UI.host && e.isTrusted) { fromPanel = false; _pageInputAt = Date.now(); } }, true);
+    document.addEventListener("keydown", function (e) { if (e.target !== UI.host && e.isTrusted) _pageInputAt = Date.now(); }, true);
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape" || !UI.card || e.defaultPrevented || !fromPanel) return;
+      if (e.target !== document.body && e.target !== document.documentElement) return;
+      e.preventDefault(); if (!mpAckBlocks()) closePanel(true);
+    });
   }
 
   function updateBadge(n, total) {
-    if (UI.badge && total != null) { UI.badge.textContent = n + "/" + total; UI.badge.title = n + " of " + total + " sections read"; }
+    if (UI.badge && total != null) {
+      UI.badge.textContent = n + "/" + total; UI.badge.title = n + " of " + total + " sections read";
+      if (UI.launcher) UI.launcher.setAttribute("aria-label", "PromptPort — " + n + " of " + total + " sections read");
+    }
   }
 
   // Build the panel shell (header row + tabs) and return its scrollable body.
@@ -2755,13 +4048,18 @@
   // finishes) · close. No product name or logo.
   function shell(active) {
     var root = ensureHost();
+    syncZoom();
     var wasOpen = !!(UI.card && UI.card.parentNode);
     var tabChanged = !wasOpen || currentTab !== active;
     var TAB_ORDER = ["export", "import", "find"];
     var prevIdx = wasOpen ? TAB_ORDER.indexOf(currentTab) : -1, newIdx = TAB_ORDER.indexOf(active);
+    if (currentTab === "find" && active !== "find") clearHighlights();   // leaving Find: take its highlights off the page
+    // Remember what had focus so the repaint can put it back (else it drops to <body>).
+    var fEl = wasOpen && root.activeElement && UI.card.contains(root.activeElement) ? root.activeElement : null;
+    var fWas = fEl ? (fEl === UI._fbEl && UI._fbWant) || { tag: fEl.tagName, name: focusName(fEl), tab: fEl.classList.contains("rs-tab") } : null;
     if (wasOpen) UI.card.parentNode.removeChild(UI.card);
     var card = el("div", "rs-panel " + (wasOpen ? "rs-swap" : "rs-enter") + (wasOpen && tabChanged && prevIdx >= 0 && newIdx >= 0 ? (newIdx > prevIdx ? " rs-dir-r" : " rs-dir-l") : "")); UI.card = card;
-    card.setAttribute("role", "dialog"); card.setAttribute("aria-label", "PromptPort");
+    card.setAttribute("role", "dialog"); card.setAttribute("aria-label", "PromptPort 4.1");
     if (UI.launcher) UI.launcher.setAttribute("aria-expanded", "true");
 
     var top = el("div", "rs-top");
@@ -2782,11 +4080,20 @@
     head.appendChild(nav);
 
     var x = el("button", "rs-x"); x.innerHTML = IC.x; x.title = "Close"; x.setAttribute("aria-label", "Close");
-    x.addEventListener("click", closePanel); head.appendChild(x);
+    x.addEventListener("click", function () { if (!mpAckBlocks()) closePanel(); }); head.appendChild(x);
 
     var tabs = el("div", "rs-tabs"); tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "Sections");
     var TABS = [["export", "Export", openPanel], ["import", "Import", renderImportHome], ["find", "Find", renderFindReplace]];
-    function activate(i, kb) {
+    function activate(i, kb, clicked) {
+      if (TABS[i][0] !== currentTab && mpAckBlocks()) return;
+      // Pressing the Find tab while on it keeps the screen (a replace result and its Undo / Save stay).
+      if (TABS[i][0] === "find" && currentTab === "find" && UI.card && UI.card.isConnected) {
+        if (kb) { var fa = UI.card.querySelector(".rs-tab.active"); if (fa) fa.focus(); }
+        return;
+      }
+      // Clicking the Import tab while already on it starts over at the drop zone
+      // (a kept review / Magic Port confirm is shown again when coming back from another tab).
+      if (clicked && TABS[i][0] === "import" && currentTab === "import") { _pendingReview = null; _pendingMpConfirm = null; }
       UI._kbTab = !!kb;
       TABS[i][2]();
       if (kb) setTimeout(function () { var a = UI.card && UI.card.querySelector(".rs-tab.active"); if (a) a.focus(); }, 0);
@@ -2802,7 +4109,7 @@
         b.setAttribute("role", "tab"); b.setAttribute("aria-selected", on ? "true" : "false");
         b.setAttribute("aria-controls", "rs-tabpanel"); b.tabIndex = on ? 0 : -1;
         b.insertAdjacentHTML("beforeend", IC.squig);
-        b.addEventListener("click", function (e) { activate(i, e.detail === 0); });
+        b.addEventListener("click", function (e) { activate(i, e.detail === 0, true); });
         b.addEventListener("keydown", function (e) {
           var n = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: TABS.length - 1 }[e.key];
           if (n == null) return;
@@ -2813,20 +4120,91 @@
       });
 
     top.appendChild(head); top.appendChild(tabs);
+    if (ppOrphaned()) {
+      // Reloaded / updated extension: this page still runs the old copy.
+      var orphan = el("div", "rs-note rs-orphan", PP_ORPHAN_TEXT);
+      orphan.setAttribute("role", "alert");
+      orphan.setAttribute("style", "margin:6px 12px 0;font-weight:bold;");
+      top.appendChild(orphan);
+    }
     var body = el("div", "rs-body"); panel = body;
     body.id = "rs-tabpanel"; body.setAttribute("role", "tabpanel"); body.setAttribute("aria-labelledby", "rs-tab-" + active);
     var foot = el("div", "rs-foot"); UI.foot = foot;   // sticky actions (hidden when empty)
-    // Escape closes the panel and returns focus to the launcher.
-    card.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePanel(true); }
-    });
     card.appendChild(top); card.appendChild(body); card.appendChild(foot);
+    // Short windows scroll the whole panel with the footer pinned: keep focused or
+    // scrolled-to items clear of it, and unpin a footer that would fill most of the panel.
+    try {
+      var footRO = new ResizeObserver(function () {
+        var big = foot.offsetHeight > card.clientHeight * 0.7;
+        card.classList.toggle("rs-foot-free", big);
+        card.style.scrollPaddingBottom = big ? "" : foot.offsetHeight + "px";
+      });
+      footRO.observe(foot); footRO.observe(card);
+    } catch (e) {}
+    // Fade the body's bottom edge while more content sits below it, so a cut-off line reads as "scroll".
+    function moreHint() { body.classList.toggle("rs-more", body.scrollHeight - body.scrollTop - body.clientHeight > 2); }
+    try {
+      body.addEventListener("scroll", moreHint, { passive: true }); body.addEventListener("animationend", moreHint);
+      new MutationObserver(moreHint).observe(body, { childList: true, subtree: true, characterData: true });
+      new ResizeObserver(moreHint).observe(body);
+    } catch (e) {}
     root.appendChild(card);
     currentTab = active;
+    if (fWas) Promise.resolve().then(function () { restoreFocus(card, fWas); });   // after the caller has filled the body
     return body;
+  }
+  // Reading the page clicks its own buttons/editors, which pulls focus out of the
+  // panel. If focus was in the panel when the read began and the user hasn't
+  // touched the page since, put it back afterwards.
+  var _pageInputAt = 0;
+  function focusKeeper() {
+    var a = UI.root && UI.root.activeElement, card = UI.card;
+    if (!a || !card || !card.contains(a)) return function () {};
+    var was = (a === UI._fbEl && UI._fbWant) || { tag: a.tagName, name: focusName(a), tab: a.classList.contains("rs-tab") }, t0 = Date.now();
+    return function () {
+      if (_pageInputAt >= t0 || !UI.card || document.activeElement === UI.host) return;
+      if (a !== UI._fbEl && a.isConnected && UI.card.contains(a) && !a.disabled) { try { a.focus({ preventScroll: true }); } catch (e) {} }
+      else restoreFocus(UI.card, was, true);
+    };
+  }
+  // The "Not imported" report is on screen and not yet acknowledged: ✕, Escape
+  // and tab switches point at the acknowledgement instead of leaving it. (The
+  // launcher still hides the panel; the report then waits on the Import tab.)
+  function mpAckBlocks() {
+    var pm = _pendingMp;
+    if (!(pm && pm.ack === false && pm.nagEl && UI.card && UI.card.contains(pm.nagEl))) return false;
+    try { pm.nagEl.click(); } catch (e) {}
+    return true;
+  }
+  function focusName(e) { return ((e.getAttribute && e.getAttribute("aria-label")) || e.textContent || "").replace(/\s+/g, " ").trim(); }
+  // Put focus back inside a freshly painted card: the same control (by tag +
+  // name) if it is still there, else the screen's heading, else its first control.
+  function restoreFocus(card, was, force) {
+    if (UI.card !== card || !card.isConnected) return;
+    var a = UI.root.activeElement;
+    if (a && card.contains(a) && a !== UI._fbEl) return;   // the screen already placed focus itself
+    if (!force && document.activeElement && document.activeElement !== document.body && document.activeElement !== UI.host) return;   // the user moved on to the page
+    var sel = "button:not([disabled]),a[href],input:not([disabled]),select,textarea,summary,[tabindex]:not([tabindex='-1'])";
+    var vis = function (e) { return e.getClientRects().length && !e.closest("[hidden]"); };
+    var all = [].slice.call(card.querySelectorAll(sel)).filter(vis);
+    var t = was.tab ? card.querySelector(".rs-tab.active") : null;
+    if (!t) t = all.filter(function (e) { return e.tagName === was.tag && focusName(e) === was.name && was.name; })[0];
+    if (!t) {
+      var body = card.querySelector(".rs-body");
+      t = body && body.querySelector(".rs-donehead-t,.rs-callout-h,h1,h2,h3");
+      if (t && !vis(t)) t = null;
+      if (t && t.tabIndex < 0 && !t.hasAttribute("tabindex")) t.tabIndex = -1;
+    }
+    var exact = !!t && !was.tab && focusName(t) === was.name;
+    if (!t) t = all.filter(function (e) { return !e.closest(".rs-top"); })[0] || card.querySelector(".rs-tab.active");
+    try { if (t) t.focus({ preventScroll: true }); } catch (e) {}
+    // A stand-in (e.g. the control was disabled mid-read): go back to the real one on the next repaint.
+    UI._fbEl = exact || was.tab ? null : t; UI._fbWant = exact || was.tab ? null : was;
   }
 
   function clearBody() {
+    var fEl = UI.card && UI.root.activeElement && UI.card.contains(UI.root.activeElement) && (!UI.root.activeElement.closest(".rs-top") || UI.root.activeElement === UI._fbEl) ? UI.root.activeElement : null;
+    if (fEl) { var fWas = (fEl === UI._fbEl && UI._fbWant) || { tag: fEl.tagName, name: focusName(fEl), tab: false }, card = UI.card; Promise.resolve().then(function () { restoreFocus(card, fWas); }); }
     if (panel) panel.innerHTML = "";
     if (UI.foot) {
       var keep = UI.foot.querySelector(".rs-inline-toast");   // a message still on screen survives a repaint
@@ -2839,6 +4217,8 @@
 
   function closePanel(returnFocus) {
     var hadFocus = !!(UI.card && UI.root && UI.root.activeElement && UI.card.contains(UI.root.activeElement));
+    clearHighlights();   // Find highlights never outlive the panel
+    if (UI.card && _pendingMp && _pendingMp.ack === false && currentTab === "import") toast("The “Not imported” list is kept — open Import to review it.", null, "info");
     if (UI.card && UI.card.parentNode) FX.fold(UI.card);
     UI.card = null; panel = null; currentTab = null; UI.links = null;
     if (UI.launcher) UI.launcher.setAttribute("aria-expanded", "false");
@@ -2864,8 +4244,19 @@
 
   // Non-blocking toast, optional Undo callback.
   function toastKind(msg) { return /^(Couldn't|Can't|No |Nothing|Already|Clicked Save)| 0 fields /.test(String(msg)) ? "info" : "ok"; }
+  var _toastSeq = 0;   // bumped per toast, so a delayed follow-up can tell it was superseded
+  // Dismiss after ms; an info/error message waits while hovered or focused.
+  function toastTimer(node, ms, info, done) {
+    var tm = setTimeout(done, ms);
+    if (!info) return;
+    var stop = function () { clearTimeout(tm); }, go = function () { clearTimeout(tm); tm = setTimeout(done, 2500); };
+    node.addEventListener("mouseenter", stop); node.addEventListener("focusin", stop);
+    node.addEventListener("mouseleave", go); node.addEventListener("focusout", go);
+  }
   function toast(msg, undoFn, kind) {
+    _toastSeq++;
     kind = kind || toastKind(msg);
+    var life = kind === "info" ? 6000 : 3600;   // warnings/errors stay long enough to read
     try { if (/ZIP downloaded|Backup downloaded/.test(String(msg))) FX.fly(); } catch (e) {}
     var root = ensureHost();
     var wrap = root.querySelector(".rs-toasts");
@@ -2879,7 +4270,7 @@
       var c = callout(kind === "info" ? "warn" : "ok", null, msg);
       c.classList.add("rs-inline-toast"); c.setAttribute("role", "status");
       UI.foot.insertBefore(c, UI.foot.firstChild);
-      setTimeout(function () { try { c.remove(); } catch (e) {} }, 3600);
+      toastTimer(c, life, kind === "info", function () { try { c.remove(); } catch (e) {} });
       return;
     }
     var t = el("div", "rs-toast" + (kind === "info" ? " rs-toast-info" : ""));
@@ -2900,16 +4291,16 @@
           var c2 = callout(kind === "info" ? "warn" : "ok", null, msg);
           c2.classList.add("rs-inline-toast"); c2.setAttribute("role", "status");
           UI.foot.insertBefore(c2, UI.foot.firstChild);
-          setTimeout(function () { try { c2.remove(); } catch (e) {} }, 3600);
+          toastTimer(c2, life, kind === "info", function () { try { c2.remove(); } catch (e) {} });
           return;
         }
       }
     } catch (e) {}
-    setTimeout(function () {
+    toastTimer(t, life, kind === "info", function () {
       t.style.transition = "opacity .3s,transform .3s";
       t.style.opacity = "0"; t.style.transform = "translateX(20px)";
       setTimeout(function () { try { t.remove(); } catch (e) {} }, 320);
-    }, 3600);
+    });
   }
 
   // Toasts sit to the LEFT of the launcher pill, bottom-aligned with it, so they
@@ -2925,7 +4316,10 @@
         wrap.style.right = Math.round(W - L.left + 10) + "px";
         wrap.style.bottom = Math.round(Hh - L.bottom) + "px";
         wrap.style.top = "auto";
-        wrap.style.maxWidth = Math.min(420, Math.round(L.left - 22)) + "px";
+        // Never wider than the space under the open panel (it shouldn't poke out past its left edge).
+        var cap = Math.min(420, Math.round(L.left - 22)), P = UI.card && UI.card.getBoundingClientRect();
+        if (P && P.width && L.left - 10 - P.left >= 220) cap = Math.min(cap, Math.round(L.left - 10 - P.left));
+        wrap.style.maxWidth = cap + "px";
         return true;
       }
       if (!UI.card && L && L.width) {
@@ -2941,23 +4335,19 @@
 
   // Open a file picker that accepts BOTH .zip and .md, routing by extension.
   function openAnyImportPicker() {
-    var input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".zip,.md,.markdown,.txt,application/zip,text/markdown,text/plain";
-    input.style.display = "none";
-    document.body.appendChild(input);
-    input.addEventListener("change", function () {
-      var f = input.files && input.files[0];
-      try { document.body.removeChild(input); } catch (e) {}
-      handleImportFile(f);
-    });
-    input.click();
+    pickFile(".zip,.md,.markdown,.txt,application/zip,text/markdown,text/plain", handleImportFile);
   }
 
   // Import tab home: ONE affordance — a click-or-drop zone for .zip or .md.
   function renderImportHome() {
     ++opGen; // supersede any in-flight Export collect so it can't re-render over this tab
+    if (_mpRun) { _mpRun.paint(); return; }   // a migration is running: show its progress, not the drop zone
+    if (_pendingMp) { var pm = _pendingMp.out; _pendingMp = null; renderMagicPortResults(pm); return; }
+    var cut = mpInterruptedHere();
+    if (cut) { _mpCut = null; mpRunClear(); renderMagicPortResults(mpInterruptedOut(cut)); return; }
     if (_pendingResults) { var pr = _pendingResults; _pendingResults = null; renderImportResults(pr.results, pr.opts); return; }
+    if (_pendingMpConfirm) { renderMagicPortConfirm(_pendingMpConfirm.config, _pendingMpConfirm.buf); return; }
+    if (_pendingReview) { var rv = _pendingReview; renderImportPlan(rv.plan, rv.curMap, rv.src, rv.ropts); return; }
     var body = shell("import");
     var dz = el("button", "rs-dropzone");
     dz.type = "button";
@@ -2969,8 +4359,13 @@
     dz.addEventListener("dragleave", function () { dz.classList.remove("over"); });
     dz.addEventListener("drop", function (e) {
       e.preventDefault(); dz.classList.remove("over");
-      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-      handleImportFile(f);
+      var fl = e.dataTransfer && e.dataTransfer.files;
+      if (fl && fl.length > 1) {
+        ++opGen; setLinks(false);
+        renderImportPlan({ error: "Drop one file at a time (a .zip holds a full set)." }, null);
+        return;
+      }
+      handleImportFile(fl && fl[0]);
     });
     body.appendChild(dz);
     var pills = el("div", "rs-pills");
@@ -2982,7 +4377,7 @@
         : "A 2-bucket ZIP's Main Prompt is split into the 4 buckets by its # headings; a 5-bucket ZIP goes in file by file.") +
       " You'll see every change and confirm before anything is overwritten."));
     // The last import can still be undone after leaving its results screen.
-    if (_lastBackup && !_lastBackup.undone && _lastBackup.importedKeys && _lastBackup.importedKeys.length) {
+    if (_lastBackup && !_lastBackup.undone && _lastBackup.importedKeys && _lastBackup.importedKeys.length && backupIsHere(_lastBackup)) {
       appendBackupActions(footer(), "Last import " + friendlyTime(_lastBackup.when).replace(/^at /, "at ") +
         " can still be undone — " + backupWhat() + " as they were just before it.");
     }
@@ -3001,32 +4396,85 @@
 
   // Route a dropped/picked file by extension, reusing the existing pipelines.
   var MAX_IMPORT_BYTES = 20 * 1024 * 1024;
+  var WRONG_FILE_TYPE = "That isn't a .zip or .md file — choose a PromptPort export or a Markdown file.";
+  // What the user sees when reading a file failed. Our own readers throw plain,
+  // complete sentences ("The zip looks damaged …") — those are shown; anything
+  // else (a script error) stays in the console and gets a friendly line.
+  function importErrorText(err) {
+    try { console.debug("[PromptPort] import failed:", err); } catch (e) {}
+    var m = err && err.message ? String(err.message) : "";
+    var own = err && err.constructor === Error && /^(This|The|Not a)\b/.test(m) && /\.$/.test(m) &&
+      !/Cannot read|is not a function|is not defined|undefined|\[object /.test(m);
+    return own ? m : "Couldn't read that file — choose a PromptPort export (.zip) or a Markdown (.md) file.";
+  }
+  // Text that is really a binary file (image, PDF, Office document) read as text.
+  function looksBinary(txt) {
+    var t = String(txt || "");
+    if (t.indexOf("\u0000") !== -1) return true;
+    var bad = (t.match(/\uFFFD/g) || []).length;
+    return bad >= 8 || (bad > 0 && bad / t.length > 0.01);
+  }
+  // Decode a picked .md file's bytes. UTF-8 (with or without BOM) and UTF-16 as
+  // before; a file that is not valid UTF-8 and has no NUL bytes is an "ANSI"
+  // (Windows-1252 / Latin-1) text file from an older editor — decoded as such
+  // instead of being refused or mangled into U+FFFD.
+  function decodeImportBytes(u8) {
+    var txt = window.PPUnzip && window.PPUnzip.decodeText ? window.PPUnzip.decodeText(u8) : new TextDecoder("utf-8").decode(u8);
+    if (String(txt).indexOf("\uFFFD") === -1) return txt;
+    try { new TextDecoder("utf-8", { fatal: true }).decode(u8); return txt; } catch (e) {}   // real U+FFFD in valid UTF-8
+    if (u8.indexOf(0) !== -1) return txt;   // NUL bytes: UTF-16 or binary — leave it to looksBinary
+    try {
+      var ansi = new TextDecoder("windows-1252").decode(u8);
+      var ctl = (ansi.match(/[\u0000-\u0008\u000B\u000E-\u001F\u007F]/g) || []).length;
+      return ctl > 0 && ctl / ansi.length > 0.01 ? txt : ansi;   // many control bytes: binary, not text
+    } catch (e) { return txt; }
+  }
+  var BUSY_MSG = "Wait for the current task to finish.";
   function handleImportFile(file) {
     if (!file) return;
+    if (_mpRun) { toast("A Magic Port migration is running — wait for it to finish before importing another file.", null, "info"); return; }
+    // Reading the file and the current fields drives the page: one task at a time.
+    if (typeof ppLock === "function" && !ppLock("import")) { toast(BUSY_MSG, null, "info"); return; }
+    var locked = true, unlock = function () { if (locked && typeof ppUnlock === "function") ppUnlock("import"); locked = false; };
+    _pendingReview = null; _pendingMpConfirm = null;
     ++opGen;
     setLinks(false);   // a new activity started
     if (file.size > MAX_IMPORT_BYTES) {
-      renderImportPlan({ error: "“" + file.name + "” is " + Math.round(file.size / 1048576) + " MB — too large to import (the limit is 20 MB). Prompt files are usually well under 1 MB." }, null);
+      unlock();
+      renderImportPlan({ error: "“" + file.name + "” is " + (Math.ceil(file.size / 1048576 * 10) / 10).toFixed(1) + " MB — too large to import (the limit is 20 MB). Prompt files are usually well under 1 MB." }, null);
       return;
     }
     var name = (file.name || "").toLowerCase();
+    if (!/\.(zip|md|markdown|txt)$/.test(name)) {
+      unlock();
+      renderImportPlan({ error: WRONG_FILE_TYPE }, null);
+      return;
+    }
     if (/\.zip$/.test(name)) {
       file.arrayBuffer().then(function (buf) {
         // Magic Port zip? (contains magicport.json) -> full-bot migration.
+        // (PPUnzip parses the buffer once; readZipSource reuses that result.)
         return peekMagicPort(buf).then(function (mp) {
-          if (mp) { renderMagicPortConfirm(mp.config, buf); return; }
+          if (mp && mp.error) { unlock(); renderImportPlan({ error: mp.error }, null); return; }
+          if (mp) { unlock(); renderMagicPortConfirm(mp.config, buf); return; }
           // otherwise the existing prompt-only import
-          return readZipSource(buf).then(beginImport);
+          return readZipSource(buf).then(beginImport).then(unlock, function (e) { unlock(); throw e; });
         });
-      }).catch(function (err) { renderImportPlan({ error: (err && err.message) || "Could not read the zip." }, null); });
+      }).catch(function (err) { unlock(); renderImportPlan({ error: importErrorText(err) }, null); });
     } else {
-      var rd = file.text ? file.text() : new Promise(function (res, rej) {
+      // Read the bytes and decode them ourselves: a UTF-16 ("Unicode" in
+      // Notepad) or BOM-prefixed UTF-8 file is text too.
+      var rd = file.arrayBuffer ? file.arrayBuffer().then(function (ab) {
+        return decodeImportBytes(new Uint8Array(ab));
+      }) : (file.text ? file.text() : new Promise(function (res, rej) {
         var fr = new FileReader(); fr.onload = function () { res(fr.result); }; fr.onerror = rej; fr.readAsText(file);
-      });
+      }));
       Promise.resolve(rd).then(function (txt) {
-        if (!txt || !txt.trim()) { renderImportPlan({ error: "That file was empty." }, null); return; }
-        beginImport(sourceFromMd(txt, file.name));
-      }).catch(function () { renderImportPlan({ error: "Couldn't read the file." }, null); });
+        txt = String(txt == null ? "" : txt).replace(/^\uFEFF/, "");
+        if (!txt || !txt.trim()) { unlock(); renderImportPlan({ error: "That file was empty." }, null); return; }
+        if (looksBinary(txt)) { unlock(); renderImportPlan({ error: WRONG_FILE_TYPE }, null); return; }
+        return Promise.resolve(beginImport(sourceFromMd(txt, file.name))).then(unlock, unlock);
+      }).catch(function () { unlock(); renderImportPlan({ error: "Couldn't read the file." }, null); });
     }
   }
 
@@ -3041,18 +4489,45 @@
     var cfgEntry = [].slice.call(entries).filter(function (f) { return /(^|\/)magicport\.json$/i.test(f.name); })[0];
     if (!cfgEntry) return null;
     var config;
-    try { config = JSON.parse(cfgEntry.text); } catch (e) { return null; }
+    try { config = JSON.parse(cfgEntry.text); } catch (e) { return { error: MP_DAMAGED }; }
+    if (!mpConfigShapeOk(config)) return { error: MP_DAMAGED };
     return { config: config, names: names };
+  }
+  var MP_DAMAGED = "This Magic Port file is damaged — export it again.";
+  // magicport.json must have the shapes the confirm screen and the engine read:
+  // objects where objects go, lists where lists go, a text bot name. (A missing
+  // or null field is fine — it just means "nothing of that kind".)
+  function mpConfigShapeOk(c) {
+    var isObj = function (v) { return v != null && typeof v === "object" && !Array.isArray(v); };
+    var objOrNone = function (v) { return v == null || isObj(v); };
+    // A list's entries must be objects (or text, for the prompt file names) —
+    // a null / number / nested-list entry would crash the confirm screen.
+    var listOrNone = function (v, str) {
+      return v == null || (Array.isArray(v) && v.every(function (x) { return str ? typeof x === "string" : isObj(x); }));
+    };
+    if (!isObj(c)) return false;
+    if (!objOrNone(c.data) || !objOrNone(c.source) || !objOrNone(c.notPortable)) return false;
+    var src = c.source || {}, d = c.data || {}, np = c.notPortable || {};
+    if (src.botName != null && typeof src.botName !== "string") return false;
+    if (!listOrNone(d.variables) || !listOrNone(d.events) || !listOrNone(d.promptFiles, true) || !listOrNone(np.nonApiTools)) return false;
+    if (!objOrNone(d.customAnalysis) || !objOrNone(d.tools) || !objOrNone(d.languageVoice) || !objOrNone(d.llmStt) || !objOrNone(d.callConfig)) return false;
+    if (d.customAnalysis && !listOrNone(d.customAnalysis.keys)) return false;
+    if (d.tools && !["pre_call", "on_call", "post_call"].every(function (p) { return listOrNone(d.tools[p]); })) return false;
+    return true;
   }
 
   // Analysis keys with their source type and the type they will be created as on
   // this dashboard. Types matter (a Number key written as String breaks reporting),
   // so the mapping is shown BEFORE migrating, and any key whose type cannot be
   // matched exactly is called out in a warning that cannot be collapsed away.
-  function mpKeyTypeTable(keys) {
+  function mpKeyTypeTable(keys, exact) {
     var wrap = el("div", "rs-mp-keys");
     var cap = function (t) { t = String(t == null ? "" : t).trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : "String"; };
-    var rows = keys.map(function (k) { var m = window.MagicPort.mapKeyTypeDash5ToDash2(k.type); return { name: k.name, from: cap(k.type), to: m.type, flagged: m.flagged, why: m.why }; });
+    // exact: the keys come from another 2-field bot, already in this
+    // dashboard's types — they are created exactly as they are.
+    var rows = keys.map(function (k) {
+      if (exact) return { name: k.name || k.key, from: cap(k.type), to: cap(k.type), flagged: false, why: "" };
+      var m = window.MagicPort.mapKeyTypeDash5ToDash2(k.type); return { name: k.name, from: cap(k.type), to: m.type, flagged: m.flagged, why: m.why }; });
     var flagged = rows.filter(function (r) { return r.flagged; });
     var tally = {}; rows.forEach(function (r) { tally[r.to] = (tally[r.to] || 0) + 1; });
     if (flagged.length) {
@@ -3094,18 +4569,36 @@
 
   // Wire a button so it's gated by a consent checkbox: looks disabled until
   // checked; a click while unchecked wiggles the consent block.
+  // A tick / click that matters (consent, Migrate, the acknowledgement) must come
+  // from the user — the panel's shadow root is open, so a script in the page
+  // could otherwise tick and click for them.
+  function ppTrusted(e) {
+    try { return !!(e && e.isTrusted); } catch (x) { return false; }
+  }
+  // A page script's checkbox.click() fires a TRUSTED change event, so a tick only
+  // counts when the user really pressed / tapped / keyed on the consent block
+  // (the box or its label) just before it. Returns e => true for a user's tick.
+  var PP_TICK_MS = 1500;
+  function ppUserTick(consentEl) {
+    if (!consentEl._ppTick) {
+      var at = 0;
+      var mark = function (e) { if (e.isTrusted) at = Date.now(); };
+      ["pointerdown", "mousedown", "touchstart", "keydown"].forEach(function (ty) { consentEl.addEventListener(ty, mark, true); });
+      consentEl._ppTick = function (e) { return ppTrusted(e) && at > 0 && Date.now() - at <= PP_TICK_MS; };
+    }
+    return consentEl._ppTick;
+  }
+  // proceedFn may return false: the action did not start (the button works again).
   function mpWireConsentGate(consentEl, checkbox, btn, proceedFn) {
-    var wasOn = false;
+    var wasOn = false, ticked = false;   // ticked: the box was ticked by the user
     function sync() {
-      var on = checkbox.checked;
+      var on = checkbox.checked && ticked;
       if (on && !wasOn) {
         try { var cr = checkbox.getBoundingClientRect(); FX.burst(cr.left + cr.width / 2, cr.top + cr.height / 2, "#22c55e", 12); } catch (e) {}
         setTimeout(function () { FX.wake(btn); }, 120);
       }
       wasOn = on;
       btn.setAttribute("aria-disabled", on ? "false" : "true");
-      btn.style.opacity = on ? "" : "0.45";
-      btn.style.cursor = on ? "" : "not-allowed";
     }
     function wiggle(node) {
       try {
@@ -3118,34 +4611,180 @@
       } catch (e) {}
       try { node.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) {}
     }
-    checkbox.addEventListener("change", sync); sync();
+    var userTick = ppUserTick(consentEl);
+    checkbox.addEventListener("change", function (e) { ticked = checkbox.checked && userTick(e); sync(); }); sync();
     var fired = false;   // a double/triple click must never start the action twice
-    btn.addEventListener("click", function () {
-      if (!checkbox.checked) { wiggle(consentEl); try { checkbox.focus(); } catch (e) {} return; }
+    btn.addEventListener("click", function (e) {
+      if (!(checkbox.checked && ticked)) { wiggle(consentEl); try { checkbox.focus(); } catch (x) {} return; }
+      if (!ppTrusted(e)) return;
       if (fired) return;
       fired = true;
-      proceedFn();
+      if (proceedFn() === false) fired = false;
     });
   }
 
+  // The host a Magic Port file was exported from (read from the file).
+  function mpSourceHost(src) {
+    if (!src) return "";
+    if (src.host) return String(src.host);
+    try { return src.url ? new URL(src.url).hostname : ""; } catch (e) { return ""; }
+  }
+  // 2-field dashboard hosts from manifest.json, split into production and test
+  // environments (a test host has a "qa" or "dev…" label). Nothing hard-coded.
+  // Read once at boot and kept: after the extension is reloaded or updated, this
+  // (orphaned) script can no longer read the manifest, and the production /
+  // test-environment warnings must not silently disappear.
+  var _mpHostsCache = null;
+  function mpDash2Hosts() {
+    if (_mpHostsCache && (_mpHostsCache.prod.length || _mpHostsCache.test.length)) return _mpHostsCache;
+    var hosts = [];
+    try {
+      var cs = chrome.runtime.getManifest().content_scripts || [];
+      ((cs[2] && cs[2].matches) || []).forEach(function (m) {
+        var h = (/^[^:]+:\/\/([^/]+)/.exec(m) || [])[1];
+        if (h && hosts.indexOf(h) === -1) hosts.push(h.replace(/^\*\./, ""));
+      });
+    } catch (e) {}
+    var isTest = function (h) { return h.split(".").some(function (l) { return /^(qa|dev[a-z0-9-]*|staging|test)$/i.test(l); }); };
+    _mpHostsCache = { prod: hosts.filter(function (h) { return !isTest(h); }), test: hosts.filter(isTest) };
+    return _mpHostsCache;
+  }
+  // The extension was reloaded / updated while this page stayed open: this copy
+  // of the script is cut off from it ("Extension context invalidated").
+  function ppOrphaned() {
+    try { return !(chrome && chrome.runtime && chrome.runtime.id); } catch (e) { return true; }
+  }
+  var PP_ORPHAN_TEXT = "PromptPort was updated — reload this page.";
+  function mpIsProductionHost(hostname) {
+    var H = mpDash2Hosts(), h = String(hostname || "").toLowerCase();
+    return H.prod.some(function (p) { p = p.toLowerCase(); return h === p || h.slice(-(p.length + 1)) === "." + p; });
+  }
+  // Tool / webhook URLs in the file that point at a test environment: "qa." or
+  // a dev-environment label taken from the manifest's test hosts.
+  // Label-based on the address's host name: a label that is, or starts / ends
+  // with, qa / staging / stage / dev / test / uat / sandbox / preview (qa.x,
+  // qa-api.x, x-staging.y), plus the dev-environment labels of the manifest's
+  // test hosts. A production host that merely contains the letters (api.iqa.ai)
+  // is not flagged.
+  var MP_TEST_LABEL_RE = /(^|[.-])(qa|staging|stage|dev|test|uat|sandbox|preview)([.-]|$)/i;
+  function mpTestEnvUrls(d) {
+    var marks = [];
+    mpDash2Hosts().test.forEach(function (h) {
+      h.split(".").forEach(function (l) { if (/^dev[a-z0-9-]+$/i.test(l) && marks.indexOf(l.toLowerCase()) === -1) marks.push(l.toLowerCase()); });
+    });
+    function hostOf(u) {
+      var m = /^[a-z][a-z0-9+.\-]*:\/\/([^\/?#]+)/i.exec(u) || /^\/*([^\/?#\s]+)/.exec(u);
+      return m ? m[1].replace(/^[^@]*@/, "").replace(/:\d+$/, "").toLowerCase() : "";
+    }
+    // Returns one label per item ("tool fetch_due: test-environment address");
+    // the address itself is never shown (it would name the dashboard's site).
+    var out = [], seen = [];
+    function check(u, who) {
+      u = String(u || "").trim(); if (!u) return;
+      var h = hostOf(u);
+      if (h && (MP_TEST_LABEL_RE.test(h) || h.split(".").some(function (l) { return marks.indexOf(l) !== -1; }))) {
+        var k = who + "\n" + u; if (seen.indexOf(k) !== -1) return;
+        seen.push(k); out.push(who + ": test-environment address");
+      }
+    }
+    ["pre_call", "on_call", "post_call"].forEach(function (p) {
+      ((d.tools || {})[p] || []).forEach(function (t) {
+        if (!t) return;
+        check(t.url || (t.raw && t.raw.config && t.raw.config.url) || (t.raw && t.raw.url), "tool " + (t.name ? String(t.name) : "(unnamed)"));
+      });
+    });
+    (d.events || []).forEach(function (e, i) { if (e) check(e.url, "webhook " + (i + 1) + (e.name ? " (" + e.name + ")" : "")); });
+    return out;
+  }
+
+  // "1 tool" / "2 tools" — one helper for every count on the Magic Port screens.
+  function mpCount(n, one, many) { n = +n || 0; return n + " " + (n === 1 ? one : (many || one + "s")); }
   // Summary + one-click "Migrate" confirmation before writing anything.
   function renderMagicPortConfirm(config, arrayBuffer) {
     ++opGen;
+    _pendingMpConfirm = { config: config, buf: arrayBuffer }; _pendingReview = null;   // kept if the panel is closed (never the consent tick)
     freshPanel("Magic Port — import");
     var d = config.data || {};
+    var src = config.source || {};
     var dest = window.MagicPort.hostPlatform();
+    // Magic Port only writes onto a 2-field dashboard bot: say so up front
+    // instead of asking for consent and failing after.
+    if (dest !== window.MagicPort.DASH2) {
+      panel.appendChild(callout("info", "This page can't receive a Magic Port import",
+        "Magic Port imports onto a 2-field dashboard bot. Open the destination bot there and drop this file."));
+      addCloseRow();
+      return;
+    }
+    var toolCount = 0; ["pre_call", "on_call", "post_call"].forEach(function (p) { toolCount += ((d.tools || {})[p] || []).length; });
+    var ca0 = d.customAnalysis || {}, lv0 = d.languageVoice || {};
+    var hasAny = (d.variables || []).length || (ca0.keys || []).length || ca0.prompt || (d.events || []).length || toolCount ||
+      (d.promptFiles || []).length || Object.keys(lv0).some(function (k) { return lv0[k] != null && lv0[k] !== ""; }) ||
+      (d.llmStt && (d.llmStt.llm || d.llmStt.stt)) || (d.callConfig && Object.keys(d.callConfig).length);
+    if (!hasAny) {
+      panel.appendChild(callout("info", "Nothing to migrate",
+        "This Magic Port file has no prompt, variables, analysis, tools or event subscriptions in it. Export the source bot again with Magic Port."));
+      addCloseRow();
+      return;
+    }
+    var srcDash2 = window.MagicPort.normPlatform ? window.MagicPort.normPlatform(src.platform) === window.MagicPort.DASH2 : false;
+    var srcHost = mpSourceHost(src);
+    var srcLayout = window.MagicPort.layoutLabel ? window.MagicPort.layoutLabel(src.platform) : "";
+    // Environments are named, never their web addresses (no site names on the UI).
+    var envOf = function (h) { if (!h) return ""; return mpIsProductionHost(h) ? "production" : (/(^|\.)(qa|dev[a-z0-9-]*|staging|test)\./i.test(h + ".") ? "test environment" : ""); };
     panel.appendChild(callout("info", "Migrate a full bot onto this bot",
-      "Source: " + (config.source && config.source.botName ? config.source.botName : "(unnamed)") + "."));
+      "Source: " + [src.botName ? src.botName : "(unnamed)", srcLayout, envOf(srcHost)].filter(Boolean).join(" · ") + "." +
+      " Destination: this bot" + (envOf(location.hostname) ? " · " + envOf(location.hostname) : "") + "."));
+    // Safety: importing a bot onto itself would only duplicate its own items.
+    var confirmBot = pageBotId();   // the bot this screen was drawn for
+    var sameBot = !!(src.botId && confirmBot && String(src.botId).toLowerCase() === confirmBot);
+    if (sameBot) {
+      var sb = callout("bad", "This is the same bot the file came from",
+        "Importing it here would add its own variables, tools and events a second time. Open a different (blank) bot to migrate onto.");
+      sb.classList.add("rs-mp-samebot");
+      panel.appendChild(sb);
+    }
+    // Environment: a test-environment address carried into production.
+    if (mpIsProductionHost(location.hostname)) {
+      var testUrls = mpTestEnvUrls(d);
+      if (testUrls.length) {
+        var tw = callout("warn", testUrls.length + " test-environment address" + (testUrls.length > 1 ? "es" : "") + " going to production",
+          "These will be written as-is on this production bot — " + testUrls.join("; ") + ". Change them after migrating if they should point to production.");
+        tw.classList.add("rs-mp-envwarn");
+        panel.appendChild(tw);
+      }
+    }
     var ul = el("div", "rs-note");
     function line(txt) { panel.appendChild(lineRow("•", null, txt)); }
-    line((d.variables || []).length + " custom variables");
-    line(((d.customAnalysis && d.customAnalysis.keys) || []).length + " custom-analysis keys" + (d.customAnalysis && d.customAnalysis.prompt ? " + analysis prompt" : ""));
-    line((d.events || []).length + " event subscription(s)");
+    line(mpCount((d.variables || []).length, "custom variable"));
+    line(mpCount(((d.customAnalysis && d.customAnalysis.keys) || []).length, "custom-analysis key") + (d.customAnalysis && d.customAnalysis.prompt ? " + analysis prompt" : ""));
+    line(mpCount((d.events || []).length, "event subscription"));
     var anKeys = (d.customAnalysis && d.customAnalysis.keys) || [];
-    if (anKeys.length && dest === window.MagicPort.DASH2) panel.appendChild(mpKeyTypeTable(anKeys));
+    if (anKeys.length && dest === window.MagicPort.DASH2) panel.appendChild(mpKeyTypeTable(anKeys, srcDash2));
     var toolN = 0; ["pre_call", "on_call", "post_call"].forEach(function (p) { toolN += ((d.tools || {})[p] || []).length; });
-    line(toolN + " tool(s)");
-    line("prompt (" + ((d.promptFiles || []).length) + " file(s)) + language/voice");
+    line(mpCount(toolN, "tool"));
+    // A 5-field source carries its languages only (no voice).
+    line("prompt (" + mpCount((d.promptFiles || []).length, "file") + ")" + (srcDash2 ? " + language/voice" : " + languages"));
+    // Sections only a 2-field source carries.
+    var pm = function (o, f) { return o ? [o.provider, o[f || "model"]].map(function (x) { return String(x || "").trim(); }).filter(Boolean).join(" · ") : ""; };
+    if (d.llmStt && (d.llmStt.llm || d.llmStt.stt)) {
+      line("LLM and STT — LLM: " + (pm(d.llmStt.llm) || "(not named)") + "; STT: " + (pm(d.llmStt.stt) || "(not named)"));
+    }
+    var lv = d.languageVoice || {};
+    if (lv.voice || lv.speed != null) {
+      line("Voice: " + (lv.voice ? ([lv.voice.name, lv.voice.provider, lv.voice.model].filter(Boolean).join(" · ") || "(not named)") : "(unchanged)") +
+        (lv.speed != null ? " — speed " + lv.speed : ""));
+    }
+    if (d.callConfig && typeof d.callConfig === "object") {
+      var ccN = Object.keys(d.callConfig).length;
+      line("Call Config: " + mpCount(ccN, "setting"));
+    }
+    if (d.customAnalysis && "model" in d.customAnalysis) {
+      line("Analysis model: " + (d.customAnalysis.model ? (pm(d.customAnalysis.model, "name") || pm(d.customAnalysis.model) || "(not named)") : "dashboard default"));
+    }
+    if (srcDash2) {
+      panel.appendChild(callout("info", "Copied exactly",
+        "The source is a 2-field bot: analysis keys (with their types), variables (with their types) and the selected events are copied exactly as they are."));
+    }
     if (config.containsCredentials) panel.appendChild(callout("warn", "Contains credentials", "Tool cURLs / webhook URLs may include keys or tokens; they'll be written as-is."));
     // Tell the user up-front what the source bot HAS that won't be migrated
     // (non-API tools: widgets/callback/whatsapp; 3rd+ languages). These are out
@@ -3161,114 +4800,498 @@
 
     // ---- required consent (import OVERWRITES everything on this bot) --------
     var c = mpConsentBlock(
-      "<b>This will change this bot.</b> Magic Port writes the imported bot's prompt, language/voice and analysis over this bot's, and <b>adds</b> its variables, tools and event subscriptions. Anything already here that the imported bot doesn't have is <b>left in place</b> — nothing is deleted — and the results screen lists what was left. Use a <b>blank bot</b> unless you mean to change this one. I understand and want to continue.");
+      "<b>This will change this bot.</b> Magic Port writes the imported bot's prompt, " + (srcDash2 ? "language/voice" : "languages") + " and analysis over this bot's, and <b>adds</b> its variables, tools and event subscriptions. Anything already here that the imported bot doesn't have is <b>left in place</b> — nothing is deleted — and the results screen lists what was left. Use a <b>blank bot</b> unless you mean to change this one. I understand and want to continue.");
     panel.appendChild(c.wrap);
 
     var foot = footer();
     var row = el("div", "rs-row");
     var go = el("button", "rs-btn rs-btn-primary", "Migrate");
     var cancel = el("button", "rs-btn rs-btn-ghost", "Cancel");
-    mpWireConsentGate(c.wrap, c.checkbox, go, function () {
+    if (sameBot) {
+      // Locked outright — the consent tick does not unlock it.
+      go.disabled = true;
+      go.setAttribute("aria-disabled", "true"); go.style.opacity = "0.45"; go.style.cursor = "not-allowed";
+      go.title = "This is the same bot the file came from — open a different bot to migrate onto.";
+      c.checkbox.disabled = true;
+      c.wrap.classList.add("rs-mp-consent-off");
+      var lbl = c.wrap.querySelector(".rs-mp-consent-text"); if (lbl) lbl.style.cursor = "not-allowed";
+    } else mpWireConsentGate(c.wrap, c.checkbox, go, function () {
+      // Checked again at the click, not only when this screen was drawn: the page
+      // may have moved to another bot (or onto the source bot) since.
+      var botNow = pageBotId();
+      if (botNow !== confirmBot || (src.botId && botNow && String(src.botId).toLowerCase() === botNow)) {
+        toast(botNow !== confirmBot ? "You moved to another bot — check the details again before migrating." :
+          "This is the same bot the file came from — open a different bot to migrate onto.", null, "info");
+        renderMagicPortConfirm(config, arrayBuffer);
+        return false;
+      }
+      if (_mpRun || ppBusy()) { toast(ppBusyText(), null, "info"); return false; }
       go.setAttribute("aria-disabled", "true"); go.style.opacity = "0.45"; go.style.cursor = "not-allowed";
       runMagicPortImport(config, arrayBuffer);
     });
-    cancel.addEventListener("click", function () { renderImportHome(); });
+    cancel.addEventListener("click", function () { _pendingMpConfirm = null; renderImportHome(); });
     row.appendChild(go); row.appendChild(cancel);
     foot.appendChild(row);
   }
 
   // Run the full import via the orchestrator; wire the prompt step to the
   // existing prompt pipeline (resolveImportPlan -> runImport).
+  // A prompt file that is empty or only our "nothing found" placeholder comment.
+  function mpEmptyPromptFile(text) {
+    var t = String(text == null ? "" : text).replace(/<!--[\s\S]*?-->/g, "");
+    // A collated Main Prompt made only of bucket headings is empty too.
+    t = t.split(/\r?\n/).filter(function (ln) { return !/^\s{0,3}#{1,6}\s*(objective|response guidelines?|conversation (flow|script)|faqs?|main prompt|first message)\s*#*\s*$/i.test(ln); }).join("\n");
+    return !t.replace(/\s+/g, "");
+  }
+  var MP_MOVED = "you moved to another bot";
+  // The sections run() goes through for this file, in order (for "not run" rows).
+  function mpPlannedSections(config) {
+    var md = {};
+    try { md = (window.MagicPort.mapForDestination(config, window.MagicPort.hostPlatform()) || {}).data || {}; } catch (e) { md = (config && config.data) || {}; }
+    var ls = md.llmStt;
+    var hasLlmStt = !!(ls && ((ls.llm && (ls.llm.provider || ls.llm.model)) || (ls.stt && (ls.stt.provider || ls.stt.model))));
+    var hasCallConfig = !!(md.callConfig && typeof md.callConfig === "object" && Object.keys(md.callConfig).length);
+    var out = ["variables", "tools", "prompt", "languageVoice"];
+    if (hasLlmStt) out.push("llmStt");
+    if (hasCallConfig) out.push("callConfig");
+    return out.concat(["analysis", "events", "final-save"]);
+  }
+  // ---- a migration's progress survives a reload / a session-expiry redirect ----
+  // While a run goes, what it has done so far is kept in this tab's
+  // sessionStorage (same tab, same site; nothing secret: section names, counts,
+  // item names). A run that ends normally removes it. If the page is reloaded or
+  // sent to the login page mid-run, the next page finds it and the Import tab
+  // shows "Last migration was interrupted" with what was done.
+  var MP_RUN_KEY = "promptport-v41-mp-run";
+  var MP_PART = "stopped part-way — check it on the page";
+  var MP_RUN_MAX_AGE = 12 * 3600 * 1000;
+  function mpRunSave(rec) {
+    try { if (rec) window.sessionStorage.setItem(MP_RUN_KEY, JSON.stringify(rec)); } catch (e) {}
+  }
+  function mpRunClear() {
+    try { window.sessionStorage.removeItem(MP_RUN_KEY); } catch (e) {}
+  }
+  // The stored record, checked field by field (the page can write this storage too).
+  function mpRunLoad() {
+    var rec = null;
+    try { rec = JSON.parse(window.sessionStorage.getItem(MP_RUN_KEY) || "null"); } catch (e) { rec = null; }
+    var str = function (v, n) { return typeof v === "string" ? v.slice(0, n || 300) : ""; };
+    if (!rec || typeof rec !== "object" || rec.v !== 1 || typeof rec.bot !== "string" || !Array.isArray(rec.planned) || !Array.isArray(rec.results)) return null;
+    if (!(+rec.at > 0) || Date.now() - +rec.at > MP_RUN_MAX_AGE) { mpRunClear(); return null; }
+    return {
+      v: 1, bot: str(rec.bot, 64).toLowerCase(), at: +rec.at, src: str(rec.src, 200), reached: str(rec.reached, 40),
+      planned: rec.planned.filter(function (k) { return typeof k === "string"; }).slice(0, 20).map(function (k) { return k.slice(0, 40); }),
+      results: rec.results.filter(function (r) { return r && typeof r === "object" && typeof r.section === "string"; }).slice(0, 20).map(mpRunSlim)
+    };
+  }
+  // What the report needs of a section result — short texts and counts only.
+  function mpRunSlim(r) {
+    var strs = function (a, n) { return Array.isArray(a) ? a.filter(function (x) { return typeof x === "string" || typeof x === "number"; }).slice(0, n).map(function (x) { return String(x).slice(0, 300); }) : []; };
+    var o = { section: String(r.section).slice(0, 40), ok: r.ok === true, failedItems: strs(r.failedItems, 60) };
+    if (typeof r.reason === "string" && r.reason) o.reason = r.reason.slice(0, 300);
+    ["created", "alreadyPresent", "count", "actual"].forEach(function (k) { if (typeof r[k] === "number" && isFinite(r[k])) o[k] = r[k]; });
+    ["warnings", "notes", "missing", "leftovers"].forEach(function (k) { var a = strs(r[k], 40); if (a.length) o[k] = a; });
+    return o;
+  }
+  // Record one section's result (a later result for the same section replaces it).
+  function mpRunStep(rec, r) {
+    if (!rec || !r || typeof r !== "object" || typeof r.section !== "string") return;
+    try {
+      var slim = mpRunSlim(r), i;
+      for (i = 0; i < rec.results.length; i++) if (rec.results[i].section === slim.section) break;
+      rec.results[i] = slim;
+      mpRunSave(rec);
+    } catch (e) {}
+  }
+  // The section the page shows now, as a run step name ("" if none / not one).
+  var MP_TAB_STEP = { "custom variables": "variables", "custom-variables": "variables", "tools": "tools", "prompt": "prompt",
+    "language and voice": "languageVoice", "language-voice": "languageVoice", "llm and stt": "llmStt", "llm-stt": "llmStt",
+    "call config": "callConfig", "call-config": "callConfig", "custom analysis": "analysis", "custom-analysis": "analysis",
+    "event subscription": "events", "event-subscription": "events" };
+  function mpStepOnScreen() {
+    try { return MP_TAB_STEP[String(d2CurrentTopTab() || "").toLowerCase()] || ""; } catch (e) { return ""; }
+  }
+  // A run that was cut off, for the page now showing: the same bot, or a page
+  // with no bot (the login page after a session expiry). Turned into the
+  // report's shape; the stored record is removed once it is shown.
+  var _mpCut = null;
+  try { _mpCut = mpRunLoad(); } catch (e) { _mpCut = null; }
+  function mpInterruptedHere() {
+    if (_mpRun || !_mpCut) return null;
+    var bot = pageBotId();
+    if (bot && bot !== _mpCut.bot) return null;
+    return _mpCut;
+  }
+  function mpInterruptedOut(rec) {
+    var auth = false;
+    try { auth = !!(window.MagicPortDom && window.MagicPortDom.isAuthRedirect && window.MagicPortDom.isAuthRedirect()); } catch (e) {}
+    var results = rec.results.slice(), seen = {};
+    results.forEach(function (r) { seen[r.section] = 1; });
+    var upTo = rec.planned.indexOf(rec.reached);
+    rec.planned.forEach(function (k, i) {
+      if (!seen[k] && i <= upTo) results.push({ section: k, ok: false, reason: MP_PART, failedItems: [] });
+    });
+    return { ok: false, interrupted: true, interruptWhy: auth ? "session expired (logged out)" : "the page was reloaded or left",
+      srcName: rec.src, results: results, planned: rec.planned, notes: [], warnings: [],
+      backupNote: "Undo isn't available for this migration: its backup was lost when the page was left." };
+  }
+  function mpInterruptNotice() {
+    setTimeout(function () {
+      try {
+        if (mpInterruptedHere() && !UI.card) toast("The last Magic Port migration was interrupted — open Import to see what was done.", null, "info");
+      } catch (e) {}
+    }, 1200);
+  }
   async function runMagicPortImport(config, arrayBuffer) {
+    // One migration at a time: a second one would write over the first.
+    if (_mpRun) { toast("A Magic Port migration is already running — wait for it to finish.", null, "info"); return; }
+    // …and never while another job (an export tour, an import, Replace) drives the page.
+    if (!ppLock("migrate")) { toast(ppBusyText(), null, "info"); return; }
+    _pendingMpConfirm = null; _pendingReview = null;
+    // The run is tied to the bot it started on: if the page moves to another bot
+    // (SPA navigation) every later step and hook stops instead of writing there.
+    var run = _mpRun = { paused: false, bot: pageBotId(), moved: false };
+    _mpCut = null;   // a new run replaces any older interrupted report
+    var rec = run.rec = { v: 1, bot: run.bot, at: Date.now(), src: String((config && config.source && config.source.botName) || "").slice(0, 200),
+      planned: [], results: [], reached: "" };
+    try { rec.planned = mpPlannedSections(config); } catch (e) {}
+    mpRunSave(rec);
+    // Moved = the page now shows a different bot (or no bot) — but a bounce to
+    // the login page is a session expiry, reported as such, not a move.
+    function botMoved() {
+      if (!run.moved && pageBotId() !== run.bot) {
+        var auth = false;
+        try { auth = !!(origAuth ? origAuth.call(MPD) : (MPD && MPD.isAuthRedirect && MPD.isAuthRedirect())); } catch (e) {}
+        if (!auth) run.moved = true;
+      }
+      return run.moved;
+    }
+    var keepFocus = focusKeeper();   // the run drives the page; focus goes back to the panel after
+    var status, runningHtml, out;
+    var MPI = window.MagicPortImport, MPD = window.MagicPortDom, origAuth = null;
+    // Painted again whenever the Import tab is opened while the run is going.
+    run.paint = function () {
     freshPanel("Magic Port — migrating…");
-    var status = el("div", "rs-note rs-working");
+    status = el("div", "rs-note rs-working");
     status.innerHTML = IC.spin + "<span>Writing sections… do not navigate away.</span>";
     status.setAttribute("aria-live", "polite");
+    if (runningHtml == null) runningHtml = status.innerHTML;
+    if (run.paused) run.onPause(true);
     try {
       var scene = el("div"); scene.innerHTML = FX.portScene("Source bot", "This bot");
       panel.appendChild(scene);
     } catch (e) {}
     panel.appendChild(status);
+    };
+    try {
+    run.paint();
 
-    // backup current prompt fields (reuse the existing undo snapshot)
-    try { _lastBackup = await snapshotBuckets(); } catch (e) {}
+    // Backup of the prompt fields for Undo — read on the Prompt tab (its editors
+    // exist only there), never "whatever editors another tab shows". An empty or
+    // unreadable backup is not kept: Undo would only empty the fields.
+    _lastBackup = null;
+    run.backupNote = "";
+    try {
+      var g00 = isTwoField() ? twoFieldEditors() : null;
+      if (g00 && !(g00.fm && g00.mp) && MPI && typeof MPI.gotoTab === "function") {
+        await MPI.gotoTab("Prompt", { budgetMs: 6000 });
+        for (var w0 = 0; w0 < 20; w0++) { var g0 = twoFieldEditors(); if (g0.fm && g0.mp) break; await sleep(150); }
+      }
+    } catch (e) {}
+    var bk = null;
+    try {
+      var g1 = isTwoField() ? twoFieldEditors() : null;
+      if (!g1 || (g1.fm && g1.mp)) bk = await runExclusive(snapshotBuckets);
+    } catch (e) { bk = null; }
+    var bkHasText = !!(bk && (bk.sections || []).some(function (x) { return x && x.text && String(x.text).trim(); }));
+    if (bkHasText) { bk.botId = run.bot; bk.magicPort = true; _lastBackup = bk; }
+    else run.backupNote = bk
+      ? "Undo isn't offered for this migration: the prompt fields were empty before it, so there is nothing to put back."
+      : "Undo isn't offered for this migration: the prompt fields couldn't be read before it started.";
+
+    // Every page check the run makes for a login bounce also stops it once the
+    // page has moved to another bot.
+    try {
+      if (MPD && typeof MPD.isAuthRedirect === "function") {
+        origAuth = MPD.isAuthRedirect;
+        // The section showing before the run starts (the backup opened Prompt)
+        // says nothing about progress: sampled only once the run has moved on.
+        var sampledAt = 0, startStep = mpStepOnScreen(), leftStart = false;
+        MPD.isAuthRedirect = function () {
+          // Where the run has got to (steps go in order): kept for a cut-off report.
+          if (Date.now() - sampledAt > 300 && !run.moved) {
+            sampledAt = Date.now();
+            var st = mpStepOnScreen();
+            if (st && st !== startStep) leftStart = true;
+            if (st && leftStart && rec.planned.indexOf(st) > rec.planned.indexOf(rec.reached)) { rec.reached = st; mpRunSave(rec); }
+          }
+          return botMoved() || origAuth.apply(this, arguments);
+        };
+      }
+    } catch (e) { origAuth = null; }
+
+    // The destination's own config comes from the page's answers the
+    // interceptor kept: fetch the current set before the run reads it.
+    if (isTwoField()) { try { await d2AskGateway(2500); } catch (e) {} }
 
     var ctx = {
-      importPrompt: async function () {
+      // Record a finished step for a cut-off report (may be called again for
+      // the same section; the last result wins).
+      onStep: function (r) { mpRunStep(rec, r); },
+      // Re-read what the page last got from the server, then destAgentConfig().
+      refreshDest: async function (ms) {
+        try { await d2AskGateway(ms || 2500); } catch (e) {}
+        return ctx.destAgentConfig();
+      },
+      // The destination's own agent_config (from the page's last answer for this
+      // bot), so settings with no control on screen are compared against it.
+      destAgentConfig: function () {
         try {
+          var bot = pageBotId(), best = null;
+          gwStore.forEach(function (c) {
+            var m = String(c.url || "").match(/\/v1\/voiceagents\/([^\/?#]+)\/?(?:[?#]|$)/i);
+            var a = c.data && c.data.data;
+            if (m && m[1].toLowerCase() === bot && a && a.agent_config && typeof a.agent_config === "object") best = a.agent_config;
+          });
+          return best;
+        } catch (e) { return null; }
+      },
+      // For the orchestrator: a non-empty string = stop before the next step.
+      guard: function () { return botMoved() ? MP_MOVED : ""; },
+      importPrompt: async function () {
+        if (botMoved()) return { section: "prompt", ok: false, reason: MP_MOVED, stop: true };
+        try {
+          // Only ever the Prompt tab's own two editors.
+          if (isTwoField()) {
+            var pe = twoFieldEditors();
+            if (!(pe.fm && pe.mp)) return { section: "prompt", ok: false, reason: "the First Message / Main Prompt editors weren't found on the Prompt tab" };
+          }
           var src = await readZipSource(arrayBuffer);
           var cur = await runExclusive(collectSections);
+          if (botMoved()) return { section: "prompt", ok: false, reason: MP_MOVED, stop: true };
           var curMap = {}; (cur || []).forEach(function (c) { curMap[c.key] = c.text || ""; });
           var plan = resolveImportPlan(src, curMap);
+          // An empty source file (or our "nothing found" placeholder) never
+          // clears the destination: it is skipped and reported.
+          var skipped = [];
+          var matched = (plan.matched || []).filter(function (m) {
+            if (m && m.file && !mpEmptyPromptFile(m.file.text)) return true;
+            skipped.push(((m && m.sec && m.sec.title) || "Prompt") + " — the source file was empty; left as is");
+            return false;
+          });
           // First pass writes all buckets; then each bucket that didn't take is
           // retried individually (up to 3 attempts total), and the rest proceed.
-          var results = await runImport(plan.matched);
+          var results = matched.length ? await runImport(matched) : [];
           var byTitle = {}; results.forEach(function (r) { byTitle[r.title] = r; });
           var failed = [];
-          for (var i = 0; i < plan.matched.length; i++) {
-            var m = plan.matched[i];
+          for (var i = 0; i < matched.length; i++) {
+            var m = matched[i];
             var r0 = byTitle[m.sec.title];
             var ok = !!(r0 && r0.ok);
             for (var a = 1; a <= 2 && !ok; a++) { // 2 more tries → 3 total
+              if (botMoved()) break;
               try { var res = await runImport([m]); ok = !!(res[0] && res[0].ok); } catch (e) { ok = false; }
               if (!ok) await sleep(250);
             }
             if (!ok) failed.push(m.sec.title);
           }
-          return { section: "prompt", ok: failed.length === 0, failedItems: failed };
+          if (botMoved()) return { section: "prompt", ok: false, reason: MP_MOVED, stop: true, failedItems: failed };
+          var promptNotes = [];
+          if (isTwoField()) {
+            var plainRefs = 0;
+            matched.forEach(function (pm) { plainRefs += countNonVariableRefs(pm && pm.file && pm.file.text); });
+            if (plainRefs) promptNotes.push(plainRefsNote(plainRefs));
+            // New layout: a table can make the final Save fail — say why up front.
+            var pe2 = twoFieldEditors();
+            [[pe2.fm, "First Message"], [pe2.mp, "Main Prompt"]].forEach(function (x) {
+              var tw = v2TableSaveWarning(x[0]);
+              if (tw) promptNotes.push(x[1] + ": " + tw + ".");
+            });
+          }
+          var pRes = { section: "prompt", ok: failed.length === 0 && skipped.length === 0, failedItems: failed.concat(skipped), notes: promptNotes };
+          mpRunStep(rec, pRes);
+          return pRes;
         } catch (e) { return { section: "prompt", ok: false, reason: String(e) }; }
       },
       // Write markdown/plain text into a TipTap editor (e.g. the Custom Analysis
       // System Prompt), reusing the proven paste path. Returns true on success.
       pasteTipTap: async function (editorEl, text) {
+        if (botMoved()) return false;
         try {
-          var html = mdToHydratedHtml(String(text || ""));
+          var t = String(text || "");
+          // A 2-field export carries the analysis prompt as the editor's own HTML;
+          // converting it as Markdown escaped every "&amp;" a second time (live
+          // 2026-11-03). Paste HTML as HTML — through the same sanitizer as
+          // every other import (the file is untrusted input).
+          var isHtml = /^\s*</.test(t) && /<\/(p|h[1-6]|ul|ol|li|span|div|strong|em)>/i.test(t);
+          var html = isHtml ? sanitizeHtml(t) : mdToHydratedHtml(t);
           return await pasteHtmlIntoEditor(editorEl, html);
         } catch (e) { return false; }
       }
     };
 
-    var out;
+    // A hidden tab can't drive the dashboard: the run pauses and says so.
+    try {
+      window.MagicPortImport.onPause = run.onPause = function (paused) {
+        run.paused = !!paused;
+        try {
+          status.innerHTML = paused
+            ? IC.pause + "<span>Paused — bring this tab to the front to continue. The dashboard only responds while its tab is visible.</span>"
+            : runningHtml;
+        } catch (e) {}
+      };
+    } catch (e) {}
+    // The dashboard's tool form sends an empty body for GET/DELETE tools, which
+    // its server refuses; the page-side helper drops it while this run adds tools.
+    var toolFix = function (on) { try { if (_bridge && typeof _bridge.send === "function") _bridge.send({ __ns: NS, type: "tool-fix", on: !!on }); } catch (e) {} };
+    toolFix(true);
     try { out = await window.MagicPortImport.run(config, window.MagicPort.hostPlatform(), ctx); }
-    catch (e) { out = { ok: false, results: [{ section: "run", ok: false, reason: String(e) }], notes: [] }; }
+    catch (e) {
+      // The raw error goes to the console only; the user sees a plain sentence.
+      try { console.debug("[PromptPort] Magic Port run failed:", e); } catch (e2) {}
+      out = { ok: false, results: [{ section: "run", ok: false, reason: MP_STOPPED }], notes: [] };
+    }
+    toolFix(false);
+    out = out || { ok: false, results: [], notes: [] };
 
     // Surface the export-time "not ported" notes (non-API tools, extra languages)
     // on the results report too, so the final summary is complete.
     out.notes = (out.notes || []).concat(config.notes || []);
+    // Every section's own notes / warnings (de-duplicated).
+    out.warnings = (out.warnings || []).slice();
+    (out.results || []).forEach(function (r) {
+      if (!r) return;
+      (r.notes || []).forEach(function (n) { if (out.notes.indexOf(n) === -1) out.notes.push(n); });
+      (r.warnings || []).forEach(function (n) { if (out.warnings.indexOf(n) === -1) out.warnings.push(n); });
+    });
+    out.notes = out.notes.filter(function (n, i) { return out.notes.indexOf(n) === i; });
+    if (run.moved || botMoved()) { out.moved = true; out.ok = false; }
+    out.planned = mpPlannedSections(config);
+    out.backupNote = run.backupNote;
+    } finally {
+      try { if (origAuth && MPD) MPD.isAuthRedirect = origAuth; } catch (e) {}
+      mpRunClear();   // the run ended here (not cut off): no "interrupted" report
+      _mpRun = null;
+      ppUnlock("migrate");
+    }
 
-    renderMagicPortResults(out);
+    // Finished while the user is elsewhere (another tab, or the panel closed):
+    // leave what they are doing alone; the Import tab shows the results.
+    if (UI.card && currentTab === "import") { renderMagicPortResults(out); keepFocus(); return; }
+    _pendingMp = { out: out };
+    toast("Migration finished — open Import to review.", null, "info");
   }
 
+  var MP_STOPPED = "stopped unexpectedly — reload the page and check the bot";
+  // A section key the results screen has no label for, as a readable title:
+  // "webhooksV2" → "Webhooks V2", "final-save" → "Final Save".
+  function mpTitleCase(key) {
+    return String(key || "Section").replace(/[-_]+/g, " ").replace(/([a-z])([A-Z0-9])/g, "$1 $2").trim()
+      .split(/\s+/).map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join(" ");
+  }
+  // A reason that is really a script error / stack line is never shown raw.
+  // Only real script-error shapes count (an Error name with a colon, the engine's
+  // own phrases, stack lines, "[object …]"); an ordinary sentence that happens to
+  // contain "undefined" or "error" is shown as written.
+  function mpReasonText(reason) {
+    var r = String(reason == null ? "" : reason);
+    if (/\b(?:Type|Reference|Syntax|Range|URI|Eval|Internal|Aggregate|DOMException|[A-Z][A-Za-z]*)?Error\s*:|\bDOMException\b|^\s*(?:Uncaught\s+)?[A-Z][A-Za-z]*Error\b|Cannot read propert|Cannot set propert|is not a function|is not defined|is not iterable|\bat \S+ \(|\bat \S+:\d+:\d+|\.js:\d+|\[object [A-Z]|^\s*undefined\s*$|^\s*null\s*$/.test(r)) {
+      try { console.debug("[PromptPort] Magic Port section error:", r); } catch (e) {}
+      return MP_STOPPED;
+    }
+    return r;
+  }
   function renderMagicPortResults(out) {
     freshPanel("Magic Port — results");
+    out = out || { ok: false, results: [], notes: [] };
     var results = (out && out.results) || [];
     var okN = results.filter(function (r) { return r && r.ok; }).length;
-    var LABEL = { variables: "Custom Variables", tools: "Tools", prompt: "Prompt", languageVoice: "Language & Voice", analysis: "Custom Analysis", events: "Event Subscription", "final-save": "Final page Save" };
+    var LABEL0 = { run: "Migration", variables: "Custom Variables", tools: "Tools", prompt: "Prompt", languageVoice: "Language & Voice", llmStt: "LLM and STT", callConfig: "Call Config", analysis: "Custom Analysis", events: "Event Subscription", "final-save": "Final Save", commit: "Save" };
+    var LABEL = {}; results.forEach(function (r) { if (r && r.section != null && !LABEL0.hasOwnProperty(r.section)) LABEL[r.section] = mpTitleCase(r.section); });
+    Object.keys(LABEL0).forEach(function (k) { LABEL[k] = LABEL0[k]; });
+    // Undo / backup only when the run got far enough to change something.
+    var changedSomething = results.some(function (r) { return r && r.section !== "run"; });
+    var moved = !!out.moved || results.some(function (r) { return r && r.reason === MP_MOVED; });
+    var authStopped = !moved && results.some(function (r) { return r && r.reason === "auth-redirect"; });
+    // A run cut off by a reload / a login redirect (rebuilt from what it stored).
+    var cut = !moved && !!out.interrupted;
+    var stopWhy = moved ? "you moved to another bot — stopped here" : "session expired (logged out) — stopped here";
+    // The last section that finished before a stop.
+    var lastDone = "";
+    for (var li = 0; li < results.length; li++) {
+      var rr = results[li];
+      if (!rr || rr.reason === "auth-redirect" || rr.reason === MP_MOVED) break;
+      if (rr.ok) lastDone = LABEL[rr.section] || rr.section;
+    }
 
     // Collect everything that failed (whole sections AND individual items that
-    // didn't make it after all retries).
-    var failures = []; // { section, items:[...] , why }
+    // didn't make it after all retries) — one entry per failed item.
+    var failures = []; // { title, item, why }
     results.forEach(function (r) {
       if (!r) return;
       var title = LABEL[r.section] || r.section;
-      var items = (r.failedItems || []).concat(r.missing || []);
+      var items = (r.failedItems || []).concat(r.missing || []).map(function (v) { return String(v); });
       if (!r.ok || items.length) {
-        var why = r.reason === "auth-redirect" ? "session expired (logged out) — stopped here"
+        var why = (r.reason === "auth-redirect" || r.reason === MP_MOVED) ? stopWhy
+                : r.reason === MP_PART ? MP_PART
                 : (r.reason && /TODO@LIVE/.test(r.reason)) ? "not available in this build yet"
                 : (r.wrong && r.wrong.length) ? ("type check failed: " + r.wrong.map(function (w) { return w.reason === "missing" ? (w.name + " (not found)") : (w.name + " (wanted " + w.want + ", got " + w.got + ")"); }).join(", "))
-                : (items.length ? "" : (r.reason || "failed"));
+                : (items.length ? "" : (r.reason ? mpReasonText(r.reason) : "failed"));
         var uniq = items.filter(function (v, idx) { return items.indexOf(v) === idx; });
-        failures.push({ title: title, items: uniq, why: why });
+        if (uniq.length) uniq.forEach(function (it) { failures.push({ title: title, item: it, why: (r.reason === "auth-redirect" || r.reason === MP_MOVED) ? stopWhy : "" }); });
+        if (!uniq.length || (why && !(r.reason === "auth-redirect" || r.reason === MP_MOVED) && r.wrong && r.wrong.length)) failures.push({ title: title, item: "", why: why });
       }
     });
+    // A stop (session expired / moved to another bot): the sections after it never ran.
+    var notRun = [];
+    if (moved || authStopped || cut) {
+      var ran = {}; results.forEach(function (r) { if (r) ran[r.section] = 1; });
+      (out.planned || []).forEach(function (k) { if (!ran[k]) notRun.push(LABEL[k] || mpTitleCase(k)); });
+      notRun.forEach(function (t) { failures.push({ title: t, item: "", why: "not run — " + (moved ? "you moved to another bot" : cut ? String(out.interruptWhy || "the page was left") : "session expired") }); });
+    }
+    if (cut && !failures.length) failures.push({ title: "Migration", item: "", why: "interrupted before it finished — check the bot" });
     // A run that stopped before importing anything (e.g. this dashboard isn't a
     // supported destination) reports no per-section results — that is a failure,
     // never "Porting Successful".
-    if (out && out.ok === false && !results.length) failures.push({ title: "Magic Port", items: [], why: out.reason || "the migration did not run" });
+    if (out && out.ok === false && !results.length && !failures.length) failures.push({ title: "Migration", item: "", why: out.reason ? mpReasonText(out.reason) : "the migration did not run" });
     var anyFail = failures.length > 0;
 
-    // Happy path: everything imported → smiley + "Porting Successful", no consent.
-    if (!anyFail) {
+    // Things to look at even when everything went in.
+    var uniqStr = function (a) { return (a || []).map(String).filter(function (v, i, all) { return v && all.indexOf(v) === i; }); };
+    var warnings = uniqStr((out.warnings || []).concat.apply(out.warnings || [], results.map(function (r) { return (r && r.warnings) || []; })));
+    var notes = uniqStr(out.notes);
+    var leftovers = [];   // { title, items }
+    results.forEach(function (r) {
+      var l = r && uniqStr(r.leftovers);
+      if (l && l.length) leftovers.push({ title: LABEL[r.section] || r.section, items: l });
+    });
+    var leftN = leftovers.reduce(function (n, g) { return n + g.items.length; }, 0);
+    var checkN = warnings.length + notes.length + leftN;
+
+    function appendChecks() {
+      warnings.forEach(function (w) { panel.appendChild(lineRow("!", null, w)); });
+      notes.forEach(function (n) { panel.appendChild(lineRow("!", null, n)); });
+      if (leftovers.length) {
+        var lb = callout("info", "Already on this bot (left in place)", null);
+        var ll = el("div"); ll.setAttribute("style", "margin-top:4px;");
+        leftovers.forEach(function (g) {
+          g.items.forEach(function (it) {
+            var d = el("div"); d.setAttribute("style", "font-size:12.5px;line-height:1.5;");
+            d.textContent = "• " + g.title + ": " + it;
+            ll.appendChild(d);
+          });
+        });
+        lb.querySelector("div:last-child").appendChild(ll);
+        panel.appendChild(lb);
+      }
+    }
+    function backupFooter() {
+      if (_lastBackup && !_lastBackup.undone) appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
+      else if (out.backupNote) panel.appendChild(lineRow("!", null, out.backupNote));
+    }
+
+    // Happy path: everything imported, nothing to check → smiley + "Porting Successful".
+    if (!anyFail && !checkN) {
       var smiley = '<svg class="rs-smile" width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
         '<circle pathLength="1" cx="12" cy="12" r="9"></circle>' +
         '<path pathLength="1" d="M8 14.5a5 5 0 0 0 8 0"></path>' +
@@ -3281,42 +5304,68 @@
       wrap.appendChild(el("div", "rs-donehead-t", "Porting Successful"));
       wrap.appendChild(el("div", "rs-donehead-s", "The whole bot was imported and saved."));
       panel.appendChild(wrap);
-      appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
+      // Items that were already on this bot were left as they were: say so.
+      var already = results.filter(function (r) { return r && +r.alreadyPresent > 0; });
+      if (already.length) {
+        var ab = callout("info", "Already on this bot (left in place)", null);
+        already.forEach(function (r) {
+          var d = el("div"); d.setAttribute("style", "font-size:12.5px;line-height:1.5;");
+          d.textContent = "• " + (LABEL[r.section] || r.section) + ": " + r.alreadyPresent + " already there";
+          ab.querySelector("div:last-child").appendChild(d);
+        });
+        panel.appendChild(ab);
+      }
+      backupFooter();
       setLinks(true);
       return;
     }
 
     var head = el("div", "rs-donehead");
     head.innerHTML = anyFail ? IC.err.replace(/width="24" height="24"/, 'width="42" height="42" class="rs-shake"') : IC.done;
-    if (!anyFail) FX.celebrate(head);
     var ht = el("div");
-    ht.appendChild(el("div", "rs-donehead-t", anyFail ? (okN ? "Migrated with failures" : "Migration did not complete") : "Migration complete"));
-    ht.appendChild(el("div", "rs-donehead-s", anyFail ? "Some items were NOT imported — review the list below." : "Everything was imported and saved."));
+    var headT = moved ? "You moved to another bot — migration stopped" + (lastDone ? " after " + lastDone : " before it changed anything") + "."
+      : cut ? "Last migration was interrupted" + (lastDone ? " after " + lastDone : "") + "."
+      : anyFail ? (okN ? "Migrated with failures" : "Migration did not complete")
+      : "Migrated — please check " + mpCount(checkN, "item");
+    var headS = moved ? "Nothing more was written. Go back to the bot you started on to check it; the rest of the list below was not migrated."
+      : cut ? "It stopped because " + String(out.interruptWhy || "the page was left") + ". Here is what was done" + (out.srcName ? " (from " + out.srcName + ")" : "") + "; sections marked not run were not migrated — check the bot and run the migration again if needed."
+      : anyFail ? "Some items were NOT imported — review the list below."
+      : "Everything was imported. Look over the points below.";
+    ht.appendChild(el("div", "rs-donehead-t", headT));
+    ht.appendChild(el("div", "rs-donehead-s", headS));
     head.appendChild(ht); panel.appendChild(head);
 
-    // Per-section summary (✓ / ✕)
+    // Per-section summary (✓ / ✕) with "N created · M already there".
+    var countsOf = function (r) {
+      var parts = [];
+      if (r.section === "analysis" && r.count != null) parts.push(mpCount(r.count, "key"));
+      else if (r.created != null) parts.push(r.created + " created");
+      else if (r.section === "variables" && r.actual != null) parts.push(r.actual + " on the bot");   // older result shape: a total, not new ones
+      if (r.alreadyPresent != null && +r.alreadyPresent > 0) parts.push(r.alreadyPresent + " already there");
+      return parts.join(" · ");
+    };
     results.forEach(function (r) {
       if (!r) return;
       var title = LABEL[r.section] || r.section;
       var nFail = (r.failedItems || []).length + (r.missing || []).length;
       if (r.ok && !nFail) {
-        var meta = r.section === "variables" ? ((r.actual != null ? r.actual + " created" : "done"))
-                 : r.section === "analysis" ? ((r.count != null ? r.count + " keys" : "done"))
-                 : r.section === "events" ? ((r.created != null ? r.created + " created" : "done")) : "done";
-        panel.appendChild(lineRow("✓", null, title, meta));
+        panel.appendChild(lineRow((r.warnings || []).length ? "!" : "✓", null, title, countsOf(r) || "done"));
       } else {
-        panel.appendChild(lineRow("✕", null, title, null, nFail ? (nFail + " item(s) failed") : "failed"));
+        var cm = countsOf(r);
+        panel.appendChild(lineRow("✕", null, title, null, (nFail ? (mpCount(nFail, "item") + " failed") : "failed") + (cm ? " · " + cm : "")));
       }
     });
+    notRun.forEach(function (t) { panel.appendChild(lineRow("○", null, t, "not run")); });
 
-    // Explicit failed-items block (what did NOT get imported).
+    // Explicit failed-items block (what did NOT get imported): one line per item.
     if (anyFail) {
       var fb = callout("bad", "Not imported", null);
       var list = el("div"); list.setAttribute("style", "margin-top:4px;");
       failures.forEach(function (f) {
         var line = el("div"); line.setAttribute("style", "font-size:12.5px;line-height:1.5;");
-        var label = f.items.length ? (f.title + ": " + f.items.join(", ")) : (f.title + (f.why ? " — " + f.why : ""));
-        if (f.items.length && f.why) label += " (" + f.why + ")";
+        // A reason that already names Magic Port stands alone (no "Migration — Magic Port …").
+        var label = f.item ? (f.title + ": " + f.item + (f.why ? " (" + f.why + ")" : ""))
+          : (f.why && /^Magic Port\b/.test(f.why) ? f.why : (f.title + (f.why ? " — " + f.why : "")));
         line.textContent = "• " + label;
         list.appendChild(line);
       });
@@ -3324,18 +5373,27 @@
       panel.appendChild(fb);
     }
 
-    (out && out.notes || []).forEach(function (n) { panel.appendChild(lineRow("!", null, n)); });
-    appendBackupActions(footer(), "Backup kept — this bot's prompt fields as they were just before the migration.");
+    appendChecks();
+    if (changedSomething) backupFooter();
 
     // Close behaviour: if anything failed, DON'T let the user close until they
     // acknowledge the failed list (consent-gated Close, same wiggle pattern).
     if (anyFail) {
       var c = mpConsentBlock("I have reviewed the items above that were <b>not imported</b> and understand they were left out. I'll handle them manually if needed.");
       panel.appendChild(c.wrap);
+      // Until it is acknowledged, the report survives closing / switching tabs:
+      // the Import tab shows it again.
+      var pend = _pendingMp = { out: out, ack: false };
+      var ackTick = ppUserTick(c.wrap);
+      c.checkbox.addEventListener("change", function (e) {
+        if (c.checkbox.checked && ackTick(e)) { if (_pendingMp === pend) _pendingMp = null; }
+        else _pendingMp = pend;
+      });
       var foot = footer();
       var closeRow = el("div", "rs-row");
       var closeBtn = el("button", "rs-btn rs-btn-primary", "Close");
       mpWireConsentGate(c.wrap, c.checkbox, closeBtn, function () { closePanel(); });
+      pend.nagEl = closeBtn;   // a locked Close wiggles the acknowledgement and focuses its checkbox
       closeRow.appendChild(closeBtn);
       foot.appendChild(closeRow);
     } else {
@@ -3359,12 +5417,59 @@
   // pass may land before every bucket has rendered), then either just preview the
   // counts (thenDownloadFormat falsy / manual ↻), or download — "five" = the 5
   // .md files, "two" = First Message + collated Main Prompt.
+  var NOTHING_TO_EXPORT = "Nothing to export — the bot page hasn't loaded its sections. Reload the page and try again.";
+  // Magic Port has nothing to work with: no section text was read AND no bot
+  // data was captured (page still loading, or the bot wasn't found).
+  function magicNothingToExport(sections, captureCount) {
+    if (captureCount == null) captureCount = captured.length + (latestAssistant && latestAssistant.data ? 1 : 0);
+    var anyText = (sections || []).some(function (s) { return s && s.text && String(s.text).trim(); });
+    return !anyText && !captureCount;
+  }
   var _exportBusy = false;
-  var _lastDl = null;         // "5-bucket ZIP downloaded." after a download, until the next activity   // a download is being prepared — ignore repeat clicks
+  var _lastDl = null;        // "5-bucket ZIP downloaded." after a download, until the next activity   // a download is being prepared — ignore repeat clicks
+  var BUSY_MSG = "Wait for the current task to finish.";
+  function sameSections(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if ((a[i] && a[i].text) !== (b[i] && b[i].text)) return false;
+    return true;
+  }
+  // A repeat press (double Enter / double click) right after a download is
+  // ignored for a moment, so one gesture never saves two identical ZIPs.
+  var _exportDoneAt = 0, _exportDoneFmt = null, EXPORT_COOLDOWN_MS = 800;
+  // While a download is prepared, the tiles show "Preparing…" in place (no
+  // repaint), so focus stays on the pressed tile instead of jumping to a tab.
+  function markExportPreparing() {
+    if (!(UI.card && currentTab === "export" && UI.foot)) return false;
+    var tiles = [].slice.call(UI.foot.querySelectorAll(".rs-cta"));
+    if (!tiles.length) return false;
+    tiles.forEach(function (b) {
+      b.setAttribute("aria-label", focusName(b));   // keeps its name, so the repaint after puts focus back on it
+      b.setAttribute("aria-disabled", "true"); b.setAttribute("data-sub", "");
+      var l = b.querySelector(".rs-cta-l"); if (l) l.textContent = "Preparing…";
+    });
+    [].forEach.call(UI.foot.querySelectorAll(".rs-foot-meta .rs-textbtn"), function (b) { b.setAttribute("aria-disabled", "true"); });
+    return true;
+  }
   function refreshExport(thenDownloadFormat) {
+    if (thenDownloadFormat && thenDownloadFormat === _exportDoneFmt && Date.now() - _exportDoneAt < EXPORT_COOLDOWN_MS) return;
     if (thenDownloadFormat && _exportBusy) { toast("Already preparing a download…"); return; }
+    // Shared busy lock (an import / Magic Port / replace is running → wait).
+    // A download takes the lock (and says so when busy). A plain preview read
+    // never blocks other controls: it is skipped quietly while a job runs, and
+    // otherwise runs without holding the lock (so opening the panel and going
+    // straight to Import never finds the drop zone disabled).
+    var holdsLock = false;
+    if (typeof ppLock === "function") {
+      if (thenDownloadFormat) { if (!ppLock("export")) { toast(BUSY_MSG, null, "info"); return; } holdsLock = true; }
+      else if (typeof ppBusy === "function" && ppBusy()) return;
+    }
     untuckLauncher();
     clearTimeout(_tuckTimer);
+    // Drop stale captures BEFORE asking for fresh ones. The page can change its
+    // own address after load (?tab=…, ?orchestration=…); the first reset then ran
+    // later, inside the read, and wiped the answers just asked for — so the first
+    // Magic Port click found "no source bot data" and only the second one worked.
+    resetIfNavigated();
     askInterceptorForLatest();
     var myGen = ++opGen;
     // Dash5 needs 3 passes (buckets render late / start collapsed); the Dash2
@@ -3375,30 +5480,70 @@
     // Repaint only while the panel is open: closing it mid-way lets the read
     // (and a requested download) finish quietly instead of reopening the panel.
     function paint(secs, o) { if (UI.card && currentTab === "export") renderPanel(secs, o); }
-    paint(null, { downloadEnabled: false, status: "Reading the page… (1 of " + PASSES + ")" });
+    var inPlace = (thenDownloadFormat === "five" || thenDownloadFormat === "two") && markExportPreparing();
+    if (!inPlace) paint(null, { downloadEnabled: false, status: "Reading the page… (1 of " + PASSES + ")" });
     // If the user switches tabs mid-way, a preview is abandoned, but a requested
     // DOWNLOAD still completes (just without repainting a view they left).
     function live() { return myGen === opGen; }
     (async function () {
       var sections = null;
-      for (var k = 1; k <= PASSES; k++) {
-        if (!live() && !thenDownloadFormat) return;
-        sections = await runExclusive(collectSections);
-        if (!live()) { if (!thenDownloadFormat) return; continue; }
-        if (k < PASSES) {
-          paint(sections, { downloadEnabled: false, status: "Reading the page… (" + (k + 1) + " of " + PASSES + ")" });
-        } else {
-          paint(sections, { downloadEnabled: true });
+      try {
+        for (var k = 1; k <= PASSES; k++) {
+          if (!live() && !thenDownloadFormat) return;
+          var prevPass = sections;
+          sections = await runExclusive(collectSections);
+          // Two passes that read the same thing → the page has settled; a third
+          // pass would only copy (and convert) every bucket again.
+          if (k > 1 && k < PASSES && sameSections(prevPass, sections)) k = PASSES;
+          if (!live()) { if (!thenDownloadFormat) return; continue; }
+          if (k < PASSES) {
+            if (!inPlace) paint(sections, { downloadEnabled: false, status: "Reading the page… (" + (k + 1) + " of " + PASSES + ")" });
+          } else {
+            paint(sections, { downloadEnabled: true });
+          }
         }
+      } catch (readErr) {
+        // A failed read pass must not swallow a requested Magic Port download:
+        // carry on with what the page / captured data gives.
+        if (thenDownloadFormat !== "magic") throw readErr;
+        sections = sections || fallbackSections();
+        if (live()) paint(sections, { downloadEnabled: true });
+      }
+      if (thenDownloadFormat === "magic" && !isTwoField()) {
+        // Make sure the bot data is in hand before building: ask again and give
+        // the answer a moment to arrive (a navigation reset may have cleared it).
+        resetIfNavigated();
+        askInterceptorForLatest();
+        await sleep(250);
+        if (magicNothingToExport(sections)) {
+          // Repaint first: a toast shown inside the panel footer (narrow window)
+          // would be wiped by a repaint that came after it.
+          if (live()) paint(sections, { downloadEnabled: true, noAnim: true, status: NOTHING_TO_EXPORT });
+          toast(NOTHING_TO_EXPORT, null, "info");
+          return false;
+        }
+      }
+      if (thenDownloadFormat === "magic" && isTwoField()) {
+        // 2-field bot: a short read-only tab tour first (see d2Tour).
+        var mpSecs = sections;
+        var okMp = await downloadMagicPortDash2(sections, function (step) {
+          if (live()) paint(mpSecs, { downloadEnabled: false, busy: true, noAnim: true,
+            status: "Reading the bot… " + (step === "collecting" ? "collecting what the tabs loaded" : "opening " + step) });
+        });
+        if (live()) paint(sections, { downloadEnabled: true, noAnim: true });
+        return okMp;
       }
       if (thenDownloadFormat && doDownload(thenDownloadFormat, sections) && live()) {
         paint(sections, { downloadEnabled: true, noAnim: true });
       }
     })().catch(function () {
       if (live()) paint(fallbackSections(), { downloadEnabled: true });
-    }).then(function () {
-      if (thenDownloadFormat) _exportBusy = false;
-    });
+      if (thenDownloadFormat === "magic") toast("Magic Port: couldn't build the file — reload the page and try again.", null, "info");
+    }).then(release, release);
+    function release() {
+      if (thenDownloadFormat) { _exportBusy = false; _exportDoneAt = Date.now(); _exportDoneFmt = thenDownloadFormat; }
+      if (holdsLock && typeof ppUnlock === "function") ppUnlock("export");
+    }
   }
 
 
@@ -3463,7 +5608,11 @@
       body.appendChild(intro);
     } else {
       var note = el("div", "rs-note rs-done-line");
-      if (opts.status) note.textContent = opts.status;
+      if (opts.status && opts.busy) {
+        note.className += " rs-working";
+        note.innerHTML = IC.spin;
+        note.appendChild(el("span", null, opts.status));
+      } else if (opts.status) note.textContent = opts.status;
       else if (loading) note.textContent = gz ? "Copying First Message and Main Prompt from the page…" : "Opening collapsed sections and copying from the page…";
       else if (idle) note.textContent = idleNote;
       else if (!anyFound) note.textContent = "Nothing found yet. Make sure the assistant page is loaded, then Refresh preview.";
@@ -3490,7 +5639,16 @@
       b.appendChild(el("span", "rs-cta-l", enabled ? label : "Preparing…"));
       b.setAttribute("data-sub", enabled ? sub : "");
       b.disabled = !enabled || !canUse;
-      if (enabled && !canUse && why) { b.title = why; b.setAttribute("aria-describedby", "rs-fivehint"); }
+      if (enabled && !canUse && why) { b.title = why; }
+      // The tooltip alone can't be reached by keyboard or touch: the same reason
+      // is the tile's accessible description (aria-describedby).
+      if (format === "five") {
+        var whyId = "rs-five-why";
+        var sr = el("span", null, enabled && !canUse && why ? why : "");
+        sr.id = whyId; sr.hidden = true;   // hidden, but still read as the description
+        b._whyEl = sr;
+        b.setAttribute("aria-describedby", whyId);
+      }
       b.addEventListener("click", function () {
         if (b.disabled) return;
         // Always re-read the page right before downloading, so an edit made
@@ -3501,19 +5659,16 @@
     }
 
     var foot = footer();
-    if (gz && enabled) {
-      var hint = buildFiveHint(five);
-      UI.fiveHint = hint;
-      body.insertBefore(hint, body.firstChild);
-    } else {
-      UI.fiveHint = null;
-    }
+    // No "5 Buckets is off / headings" callout on the 2-field page (owner's
+    // call, 2026-11-03): the 5 Buckets tile itself says "needs # headings" and
+    // its tooltip gives the reason.
     var ctas = el("div", "rs-ctas");
     var fiveBtn = mkDownloadBtn("Download 5 Buckets", gz ? (five.ok ? "split by # headings" : "needs # headings") : "5 .md files", "five", five.ok,
       five.ok ? "" : (FIVE_WHY + (five.reason || "")), IC.five);
     var twoBtn = mkDownloadBtn("Download 2 Buckets", gz ? "as on the page" : "First Message + Main Prompt", "two", true, "", IC.two);
     ctas.appendChild(fiveBtn); ctas.appendChild(twoBtn);
     foot.appendChild(ctas);
+    if (fiveBtn._whyEl) foot.appendChild(fiveBtn._whyEl);
 
     // Magic Port: the third export CTA (full-width), downloads the whole bot
     // (prompt + all configurations) as one ZIP for migration to another bot.
@@ -3539,47 +5694,6 @@
     foot.appendChild(meta);
   }
 
-  // The 2-field page's "5 Buckets" status, shown above the download buttons.
-  var HEAD_LIST = [["objective", "# Objective"], ["response-guideline", "# Response Guidelines"],
-    ["conversation-script", "# Conversation Flow"], ["faqs", "# FAQs"]];
-  function fiveHintText(r) {
-    return r.ok
-      ? "✓ Main Prompt headings recognised — 5 Buckets is available."
-      : "5 Buckets is off: " + (r.reason || "Main Prompt isn't organised under the # headings.");
-  }
-  function buildFiveHint(r) {
-    var h = el("div");
-    h.id = "rs-fivehint";
-    h.setAttribute("data-five-hint", "1");
-    fillFiveHint(h, r);
-    return h;
-  }
-  function fillFiveHint(h, r) {
-    h.innerHTML = "";
-    if (r.ok) {
-      h.className = "rs-fivehint rs-hint-ok";
-      h.appendChild(document.createTextNode(fiveHintText(r)));
-      return;
-    }
-    h.className = "rs-fivehint rs-callout";
-    h.innerHTML = IC.warn;
-    var t = el("div");
-    t.appendChild(el("div", "rs-callout-h", fiveHintText(r)));
-    var grid = el("div", "rs-heads");
-    var present = r.present || [];
-    HEAD_LIST.forEach(function (x) {
-      var on = present.indexOf(x[0]) !== -1;
-      var d = el("div", "rs-head " + (on ? "on" : "off"));
-      d.innerHTML = on ? IC.hok : IC.hx;
-      d.appendChild(document.createTextNode(x[1]));
-      d.appendChild(el("span", "rs-sr", on ? " (found)" : " (missing)"));
-      grid.appendChild(d);
-    });
-    t.appendChild(grid);
-    t.appendChild(el("div", "rs-muted", "Expected in this order. It switches on by itself as you add them."));
-    h.appendChild(t);
-  }
-
   // While the idle Export view is open on the Dash2 panel, re-check Main Prompt
   // as the user edits it, so "Download 5 Buckets" turns on/off live.
   var _fiveRecheckT = null;
@@ -3592,13 +5706,9 @@
       UI.fiveBtn.disabled = !r.ok;
       UI.fiveBtn.setAttribute("data-sub", r.ok ? "split by # headings" : "needs # headings");
       UI.fiveBtn.title = r.ok ? "" : ("5 Buckets needs Main Prompt organised under # Objective, # Response Guidelines, # Conversation Flow, # FAQs (in that order). " + (r.reason || ""));
-      if (UI.fiveHint) fillFiveHint(UI.fiveHint, r);
+      if (UI.fiveBtn._whyEl) UI.fiveBtn._whyEl.textContent = UI.fiveBtn.title;
     }, 250);
   }, true);
-
-  function startImport() {
-    openImportPicker(beginImport);
-  }
 
   // ---- import panels ------------------------------------------------------
   function freshPanel(titleText) {
@@ -3664,6 +5774,9 @@
   }
 
   function renderImportPlan(plan, curMap, src, ropts) {
+    // Kept if the panel is closed, so reopening Import shows the same review.
+    _pendingReview = plan && !plan.error && plan.matched && plan.matched.length ? { plan: plan, curMap: curMap, src: src, ropts: ropts } : null;
+    _pendingMpConfirm = null;
     freshPanel("Import — review");
     if (ropts && ropts.changed) {
       panel.appendChild(callout("warn", null, "The page changed after you opened this review, so the review was refreshed. Check it, then confirm again."));
@@ -3724,7 +5837,12 @@
       go.disabled = !changedN;
       go.addEventListener("click", async function () {
         if (go.disabled) return;
+        // One page-driving task at a time (export tour, Magic Port, replace-all).
+        if (typeof ppLock === "function" && !ppLock("import")) { toast(BUSY_MSG, null, "info"); return; }
+        var locked = true, unlock = function () { if (locked && typeof ppUnlock === "function") ppUnlock("import"); locked = false; };
+        var keepF = focusKeeper();   // backup + write drive the page; focus comes back to the results
         go.disabled = true; cancel.disabled = true;
+        _pendingReview = null;
         // Only write fields that actually change — identical ones are left
         // untouched (faster, and nothing to go wrong on a 20k-char bucket).
         var same = [];
@@ -3735,23 +5853,29 @@
         // Auto-backup the current buckets BEFORE overwriting anything.
         go.textContent = "Backing up…";
         var gen0 = opGen;
+        // The snapshot is only committed as THE backup once the write starts: a
+        // review that turns out stale (below) writes nothing and must not
+        // replace the backup of the previous import.
+        var backup = null;
         try {
-          _lastBackup = await snapshotBuckets();
-          _lastBackup.importedKeys = toWrite.map(function (m) { return m.sec.key; });
-        } catch (e) { _lastBackup = null; }
+          backup = await snapshotBuckets();
+          backup.importedKeys = toWrite.map(function (m) { return m.sec.key; });
+        } catch (e) { backup = null; }
         // Someone edited a field after this review opened → don't write a stale
         // plan; refresh the review against what's on the page now.
-        if (_lastBackup && curMap && src) {
+        if (backup && curMap && src) {
           var now = {};
-          (_lastBackup.sections || []).forEach(function (c) { now[c.key] = c.text || ""; });
+          (backup.sections || []).forEach(function (c) { now[c.key] = c.text || ""; });
           var drift = plan.matched.some(function (m) {
             return normForDiff(now[m.sec.key] || "").trim() !== normForDiff(curMap[m.sec.key] || "").trim();
           });
           if (drift) {
+            unlock();
             if (gen0 === opGen && UI.card) renderImportPlan(resolveImportPlan(src, now), now, src, { changed: true });
             return;
           }
         }
+        _lastBackup = backup;
         go.textContent = "Importing…";
         runImport(toWrite).then(async function (res) {
           var order = plan.matched.map(function (m) { return m.sec.title; });
@@ -3764,15 +5888,17 @@
               aft.forEach(function (c) { _lastBackup.after[c.key] = c.text || ""; });
             }
           } catch (e) {}
-          showImportResults(all, {}, gen0);
+          unlock();
+          showImportResults(all, {}, gen0); keepF();
         }).catch(function (err) {
-          showImportResults([{ title: "Error", ok: false, reason: (err && err.message) || "failed" }], {}, gen0);
+          unlock();
+          showImportResults([{ title: "Error", ok: false, reason: (err && err.message) || "failed" }], {}, gen0); keepF();
         });
       });
       row.appendChild(go);
     }
     cancel = el("button", "rs-btn rs-btn-ghost", plan.matched.length ? "Cancel" : "Try another file");
-    cancel.addEventListener("click", function () { if (plan.matched.length) closePanel(); else renderImportHome(); });
+    cancel.addEventListener("click", function () { _pendingReview = null; renderImportHome(); });
     row.appendChild(cancel);
     foot.appendChild(row);
   }
@@ -3796,16 +5922,50 @@
   }
   function isBtnDisabled(b) { return !b || b.disabled || b.getAttribute("aria-disabled") === "true"; }
   function saveToDash5() {
+    // New 2-field layout: the one page-wide Save in the "Unsaved changes" bar.
+    if (isTwoField() && d2NewUi()) {
+      var MPD = window.MagicPortDom;
+      if (!MPD.v2SaveBar()) { toast("Nothing to save — the page shows no unsaved changes."); return; }
+      toast("Saving…");
+      var seq0 = _toastSeq;
+      MPD.v2SaveAll(15000).then(function (r) {
+        if (seq0 !== _toastSeq && r.state === "saved") return;
+        var g = twoFieldEditors(), tbl = !!((g.fm && g.fm.querySelector("table")) || (g.mp && g.mp.querySelector("table")));
+        if (r.state === "saved" || r.state === "none") toast("Saved.");
+        else if (r.state === "failed" || r.state === "blocked")
+          toast("Save rejected: " + (r.text || "the page refused the save") +
+            (tbl ? " — the prompt holds a table, and this dashboard can fail to save tables; turn it into a list and save again." : ""), null, "info");
+        else toast("The dashboard didn't confirm the save — check the Prompt by hand.", null, "info");
+      }, function () { toast("Clicked Save — please confirm on the page.", null, "info"); });
+      return;
+    }
     var btn = findDash5SaveButton();
     if (!btn) { toast("Couldn't find the page's Save button — please Save on the page."); return; }
     if (isBtnDisabled(btn)) { toast("Nothing to save — the page shows no unsaved changes."); return; }
     try { btn.scrollIntoView({ block: "center" }); } catch (e) {}
+    // Only toasts that appear after this snapshot count (a stale "saved" toast never does).
+    var MPD5 = window.MagicPortDom, two = isTwoField();
+    var before = MPD5 && MPD5.toastSnapshot ? MPD5.toastSnapshot() : null;
     btn.click();
     toast("Saving…");
-    setTimeout(function () {
-      var after = findDash5SaveButton();
-      toast(isBtnDisabled(after) ? "Saved." : "Clicked Save — please confirm on the page.");
-    }, 700);
+    var seq = _toastSeq;
+    if (!before || !MPD5.waitToastResult) { toast("Clicked Save — please confirm on the page.", null, "info"); return; }
+    (async function () {
+      // A Save that is disabled may still be saving: wait for the page's own
+      // answer. The 2-field page answers every save with a toast; the 5-field
+      // page may not, so there a quiet, finished save that leaves Save
+      // disabled (nothing left to save) counts as saved.
+      var r = await MPD5.waitToastResult(/saved|updated|success/i, two ? 15000 : 6000, before);
+      if (MPD5.waitSaveIdle) await MPD5.waitSaveIdle(15000);
+      if (r.state !== "fail") {
+        var late = MPD5.freshToastTexts(before).filter(function (t) { return MPD5.TOAST_FAIL.test(t); })[0];
+        if (late) r = { state: "fail", text: late };
+      }
+      if (r.state === "fail") { toast("Save rejected: " + r.text, null, "info"); return; }
+      if (seq !== _toastSeq) return;   // a newer message is showing — don't cover it
+      if (r.state === "ok" || (!two && isBtnDisabled(findDash5SaveButton()))) toast("Saved.");
+      else toast("The dashboard didn't confirm the save — check the page by hand.", null, "info");
+    })().catch(function () { toast("Clicked Save — please confirm on the page.", null, "info"); });
   }
 
   function renderImportResults(results, opts) {
@@ -3841,6 +6001,7 @@
     }
   }
   function appendBackupActions(foot, text) {
+    if (!backupIsHere(_lastBackup)) return;   // another bot's backup: no Undo here
     {
       foot.appendChild(callout("ok", null, text));
       var srow = el("div", "rs-row");
@@ -3849,6 +6010,7 @@
       undo._gen = opGen;
       undo.addEventListener("click", async function () {
         if (undo.disabled) return;
+        if (!backupIsHere(_lastBackup)) { toast("This backup belongs to another bot — open that bot to undo, or download the backup.", null, "info"); return; }
         if (_lastBackup && _lastBackup.after && !undo._confirmed) {
           undo.disabled = true; var lbl = undo.lastChild; lbl.textContent = "Checking…";
           var edited = [];
@@ -3880,6 +6042,36 @@
   // while it ran, leave them be: a toast says it finished and the Import tab
   // shows the results next time it opens.
   var _pendingResults = null;
+  // Work kept in memory when the panel is closed (Escape / ✕ / launcher):
+  var _pendingReview = null;      // import review screen
+  var _pendingMpConfirm = null;   // Magic Port confirm (config + file; consent is never kept)
+  var _pendingMp = null;          // Magic Port results not yet seen / "Not imported" not yet acknowledged
+  var _mpRun = null;              // a Magic Port migration is running
+  // Leaving or reloading the page mid-migration would cut it off half-way: ask first.
+  try {
+    // The page sending itself to a login page (session expired) is not the
+    // user leaving: no prompt over it. Seen through the Navigation API where the
+    // browser has it; elsewhere the prompt stays. Progress is stored either way.
+    var _mpToAuthAt = 0;
+    if (window.navigation && typeof window.navigation.addEventListener === "function") {
+      window.navigation.addEventListener("navigate", function (e) {
+        try {
+          var u = new URL(e.destination.url);
+          var path = u.pathname.replace(/\/+$/, "") || "/";
+          if (_mpRun && u.origin === location.origin && /^(\/(accounts|account|auth|users?|identity))?\/(login|log-in|signin|sign-in|sso\/login)$/i.test(path)) _mpToAuthAt = Date.now();
+        } catch (x) {}
+      });
+    }
+    window.addEventListener("beforeunload", function (e) {
+      if (!_mpRun) return;
+      try { if (_mpRun.rec) mpRunSave(_mpRun.rec); } catch (x) {}
+      if (_mpToAuthAt && Date.now() - _mpToAuthAt < 5000) return;
+      e.preventDefault(); e.returnValue = "A Magic Port migration is running.";
+      return e.returnValue;
+    });
+    window.addEventListener("pagehide", function () { try { if (_mpRun && _mpRun.rec) mpRunSave(_mpRun.rec); } catch (x) {} });
+  } catch (e) {}
+  var _findState = null;          // Find / Replace text and options
   function showImportResults(results, opts, gen0) {
     var okN = results.filter(function (r) { return r.ok && !r.skipped; }).length;
     if (UI.card && currentTab === "import" && (gen0 == null || gen0 === opGen)) { renderImportResults(results, opts); return; }
@@ -3957,13 +6149,19 @@
     var result = el("div", "rs-result");
     panel.appendChild(result);
 
-    var hint = el("div", "rs-note", "Searches live as you type — matches highlight yellow, the current one orange. Enter / Shift+Enter jump between them. Replace all rewrites every matching field; export a backup first.");
+    var hint = el("div", "rs-note", "Searches live as you type — matches highlight yellow, the current one orange. Enter / Shift+Enter jump between them. Variable chips are skipped — Find and Replace never touch them. Replace all rewrites every matching field; export a backup first.");
     panel.appendChild(hint);
 
     function opts() { return { matchCase: mc.input.checked, wholeWord: ww.input.checked }; }
+    // Typed text survives closing the panel / switching tabs.
+    var restored = !!(_findState && _findState.q);   // restored text isn't searched until asked (no stale count)
+    if (_findState) { findIn.value = _findState.q || ""; repIn.value = _findState.r || ""; mc.input.checked = !!_findState.mc; ww.input.checked = !!_findState.ww; }
+    function keep() { _findState = { q: findIn.value, r: repIn.value, mc: mc.input.checked, ww: ww.input.checked }; }
+    [findIn, repIn].forEach(function (i) { i.addEventListener("input", keep); });
+    [mc.input, ww.input].forEach(function (i) { i.addEventListener("change", keep); });
     function updateCounter() {
       var n = _findRanges.length;
-      counter.textContent = findIn.value.trim() ? (n ? (_findIdx + 1) + "/" + n : "0/0") : "";
+      counter.textContent = findIn.value.trim() && !restored ? (n ? (_findIdx + 1) + "/" + n : "0/0") : "";
       prevBtn.disabled = nextBtn.disabled = n < 1;
     }
     prevBtn.addEventListener("click", function () { if (_findRanges.length) { stepFind(-1); updateCounter(); } });
@@ -3976,19 +6174,35 @@
     }
 
     function renderCounts(res) {
+      if (res && res.offPrompt && !res.searched) {
+        setResult(res.notOpened === "busy" ? ppBusyText()
+          : res.notOpened ? "Couldn't open the Prompt section — open it, then search again."
+          : "The Prompt section isn't open — press Find to search it (PromptPort opens it, then comes back here).", true);
+        return;
+      }
       if (!res || !res.total) { setResult("No matches.", true); return; }
-      setResult(plural(res.total, "match", "matches") + " in " + plural(res.per.length, "bucket", "buckets") + ":");
+      setResult(plural(res.total, "match", "matches") + " in " + (isTwoField() ? plural(res.per.length, "field", "fields") : plural(res.per.length, "bucket", "buckets")) + ":");
       res.per.forEach(function (p, i) { result.appendChild(lineRow(i % 2 ? "○" : "•", null, p.title, p.count + "×")); });
       if (!res.supported) {
         result.appendChild(callout("warn", null, "Counts are accurate, but this browser can't highlight matches on the page."));
+      } else if (res.unpainted) {
+        result.appendChild(el("div", "rs-muted", plural(res.unpainted, "match is", "matches are") + " inside a plain text box, which can't be highlighted."));
       }
+      if (res.searched) result.appendChild(el("div", "rs-muted", "Found on the Prompt section — open it to see the matches highlighted."));
     }
 
-    function doFind() {
+    // explicit = the Find button / Enter (may open the Prompt section on the new layout).
+    function doFind(explicit) {
+      if (!findIn.isConnected) return;   // this Find screen was left — paint nothing on the page
+      restored = false;
       var q = findIn.value;
       if (!q.trim()) {
         if (q.length) { setResult("Type a word or phrase — spaces alone aren't searched.", true); clearHighlights(); updateCounter(); return; } setResult(""); clearHighlights(); updateCounter(); return; }
-      runExclusive(function () { return findAll(q, opts()); }).then(function (res) {
+      var fo = opts(); if (explicit === true) fo.navigate = true;
+      runExclusive(function () { return findAll(q, fo); }).then(function (res) {
+        if (!findIn.isConnected) { if (currentTab !== "find") clearHighlights(); return; }
+        if (findIn.value !== q) return;   // superseded by newer typing; its own search paints
+
         renderCounts(res); updateCounter();
       }).catch(function () { setResult("Search failed.", true); });
     }
@@ -4004,7 +6218,7 @@
       if (e.key === "Enter") {
         e.preventDefault();
         if (_findRanges.length) { stepFind(e.shiftKey ? -1 : 1); updateCounter(); }
-        else doFind();
+        else doFind(true);
       }
     });
     // Keep highlights in sync when the options change.
@@ -4012,31 +6226,54 @@
     ww.input.addEventListener("change", doFind);
 
     var row = el("div", "rs-row");
-    var findBtn = mkBtn("Find", primaryBtn(), doFind);
+    var findBtn = mkBtn("Find", primaryBtn(), function () { doFind(true); });
     var repBtn = mkBtn("Replace all", secondaryBtn(), function () {
       var q = findIn.value;
       if (!q.trim()) { setResult("Type something to find first.", true); try { findIn.focus(); } catch (e) {} return; }
       if (findTimer) { clearTimeout(findTimer); findTimer = null; }   // a pending live search must not overwrite the replace result
+      // Shared busy lock (an import / export / Magic Port is running → wait).
+      if (typeof ppLock === "function" && !ppLock("replace")) { toast(BUSY_MSG, null, "info"); return; }
       repBtn.disabled = true; repBtn.textContent = "Replacing…";
       setLinks(false);   // a new activity started
       runExclusive(function () { return replaceAllBuckets(q, repIn.value, opts()); }).then(function (rs) {
+        if (typeof ppUnlock === "function") ppUnlock("replace");
         var tot = 0; rs.forEach(function (r) { tot += r.n; });
-        setResult(tot ? ("Replaced " + plural(tot, "occurrence", "occurrences") + ":") : "Nothing to replace.", !tot);
+        setResult(tot ? ("Replaced " + plural(tot, "occurrence", "occurrences") + ":")
+          : (rs.notOpened ? "Couldn't open the Prompt section — open it, then replace again." : "Nothing to replace."), !tot);
         if (tot) rs.forEach(function (r) { result.appendChild(lineRow(!r.ok ? "✕" : (r.warn ? "!" : "✓"), null, r.title, r.n + "×", r.warn || "")); });
         if (tot) {
           setLinks(true);
-          result.appendChild(el("div", "rs-muted", "Review the fields, then Save. (Replace edits the stored text; a variable chip keeps its own name.)"));
+          result.appendChild(el("div", "rs-muted", "Review the fields, then Save — or Undo replace to put them back. (Replace edits the stored text; a variable chip keeps its own name.)"));
           var srow = el("div", "rs-row");
           var sbtn = el("button", "rs-btn rs-btn-primary", "Save on page");
           sbtn.addEventListener("click", saveToDash5);
-          srow.appendChild(sbtn); result.appendChild(srow);
+          var ubtn = el("button", "rs-btn rs-btn-ghost", "Undo replace");
+          ubtn.addEventListener("click", function () {
+            if (ubtn.disabled) return;
+            ubtn.disabled = true; ubtn.textContent = "Undoing…";
+            if (typeof ppLock === "function" && !ppLock("replace")) { ubtn.disabled = false; ubtn.textContent = "Undo replace"; toast(BUSY_MSG, null, "info"); return; }
+            runExclusive(function () { return undoReplaceAll(rs); }).then(function (us) {
+              function names(a) { return a.map(function (u) { return u.title; }).join(", "); }
+              var changed = us.filter(function (u) { return u.changed; });
+              var bad = us.filter(function (u) { return !u.ok && !u.changed; });
+              var done = us.filter(function (u) { return u.ok; });
+              var msg = [];
+              if (changed.length) msg.push("The field was edited after the replace — undo skipped for: " + names(changed) + " (your edits are kept).");
+              if (bad.length) msg.push("Couldn't undo in: " + names(bad) + ".");
+              if (!msg.length) msg.push("Replace undone — the fields are back as they were.");
+              else if (done.length) msg.unshift("Undone in: " + names(done) + ".");
+              setResult(msg.join(" "), !!(changed.length || bad.length));
+              clearHighlights(); updateCounter();
+            }).catch(function () { setResult("Undo failed.", true); }).then(function () { if (typeof ppUnlock === "function") ppUnlock("replace"); });
+          });
+          srow.appendChild(sbtn); srow.appendChild(ubtn); result.appendChild(srow);
         }
         repBtn.disabled = false; repBtn.textContent = "Replace all";
         clearHighlights(); updateCounter();
-      }).catch(function () { repBtn.disabled = false; repBtn.textContent = "Replace all"; setResult("Replace failed.", true); });
+      }).catch(function () { if (typeof ppUnlock === "function") ppUnlock("replace"); repBtn.disabled = false; repBtn.textContent = "Replace all"; setResult("Replace failed.", true); });
     });
     var clearBtn = mkBtn("Clear", secondaryBtn(), function () {
-      clearHighlights(); findIn.value = ""; repIn.value = ""; setResult(""); updateCounter();
+      clearHighlights(); findIn.value = ""; repIn.value = ""; _findState = null; setResult(""); updateCounter();
       try { findIn.focus(); } catch (e) {}
     });
 
@@ -4058,10 +6295,6 @@
   // ---- popup / toolbar messaging -----------------------------------------
   chrome.runtime.onMessage.addListener(function (req, sender, sendResponse) {
     if (!req || !req.type) return;
-    if (req.type === "ping") {
-      sendResponse({ ok: true });
-      return true;
-    }
     if (req.type === "get-status") {
       // Lightweight, side-effect-free check: which buckets have an editor on the
       // page right now. Does NOT expand or copy (copying needs a real click).
@@ -4083,7 +6316,7 @@
     // The real copy needs the page's user activation, which a popup message does
     // NOT carry. So the popup never copies directly — it opens the on-page panel
     // and the user clicks Download there, guaranteeing a genuine copy.
-    if (req.type === "download" || req.type === "open-panel") {
+    if (req.type === "open-panel") {
       openPanel();
       sendResponse({ ok: true });
       return true;
@@ -4095,8 +6328,8 @@
     window.__ppTest = {
       nameFromUI: nameFromUI, fileBase: fileBase, matchSection: matchSection,
       lineDiff: lineDiff, coarseDiff: coarseDiff, escapeRegExp: escapeRegExp,
-      mdToHtml: mdToHtml, htmlToText: htmlToText, planImport: planImport,
-      parseSingleMd: parseSingleMd, matchSectionByHeading: matchSectionByHeading,
+      mdToHtml: mdToHtml, htmlToText: htmlToText,
+      parseSingleMd: parseSingleMd,
       sectionHeaderAt: sectionHeaderAt,
       collectSections: collectSections, findAll: findAll, replaceAllBuckets: replaceAllBuckets,
       sanitizeHtml: sanitizeHtml, applyReplace: applyReplace,
@@ -4105,6 +6338,8 @@
       isTwoField: isTwoField, twoFieldEditors: twoFieldEditors, splitMainPrompt: splitMainPrompt,
       twoFieldFiveSections: twoFieldFiveSections, liveMainSplit: liveMainSplit, doDownload: doDownload,
       hydrateMentions: hydrateMentions, mdToHydratedHtml: mdToHydratedHtml,
+      countNonVariableRefs: countNonVariableRefs, plainRefsNote: plainRefsNote, healDamagedTokens: healDamagedTokens,
+      magicNothingToExport: magicNothingToExport,
       snapshotBuckets: snapshotBuckets, runImport: runImport, backupStamp: backupStamp,
       getLastBackup: function () { return _lastBackup; },
       setLastBackup: function (b) { _lastBackup = b; },
@@ -4114,11 +6349,37 @@
       pasteHtmlIntoEditor: pasteHtmlIntoEditor, hasSpacerArtifacts: hasSpacerArtifacts,
       readZipSource: readZipSource, sourceFromMd: sourceFromMd, resolveImportPlan: resolveImportPlan,
       isMainPromptName: isMainPromptName, collateMain: collateMain, siteTargets: siteTargets,
-      downloadBackup: downloadBackup, beginImport: beginImport, renderImportPlan: renderImportPlan
+      downloadBackup: downloadBackup, beginImport: beginImport, renderImportPlan: renderImportPlan,
+      ppLock: ppLock, ppUnlock: ppUnlock, ppBusy: ppBusy, mpTestEnvUrls: mpTestEnvUrls, mpReasonText: mpReasonText,
+      renderMagicPortResults: renderMagicPortResults, pageBotId: pageBotId,
+      bridgeSeen: function () { return JSON.parse(JSON.stringify(_bridgeSeen)); },
+      captures: function () { return capturedMeta.map(function (m) { return { url: m.url, key: m.key, urlBot: m.urlBot }; }); },
+      // test-only feed through the same checks as the private channel (isolated world only)
+      feedBridge: function (msg) { onBridge(msg); }
     };
+  } catch (e) {}
+  // import-side helpers for the unit tests
+  try {
+    window.__ppTest.peekMagicPort = peekMagicPort; window.__ppTest.mpConfigShapeOk = mpConfigShapeOk;
+    window.__ppTest.handleImportFile = handleImportFile; window.__ppTest.renderMarkdown = renderMarkdown;
+  } catch (e) {}
+
+  // export / find-replace internals for the offline tests
+  try {
+    window.__ppTest.replaceInHtml = replaceInHtml; window.__ppTest.undoReplaceAll = undoReplaceAll;
+    window.__ppTest.fieldSignature = fieldSignature; window.__ppTest.exportFallbackSections = exportFallbackSections;
+    window.__ppTest.refreshExport = refreshExport;
+    // new 2-field layout
+    window.__ppTest.d2Tour = d2Tour; window.__ppTest.d2ProviderModelPairs = d2ProviderModelPairs;
+    window.__ppTest.d2SelectedVoice = d2SelectedVoice; window.__ppTest.d2CurrentTopTab = d2CurrentTopTab;
+    window.__ppTest.d2HasTab = d2HasTab; window.__ppTest.nameFromUI = nameFromUI; window.__ppTest.findEditors = findEditors;
+    window.__ppTest.breaksToParagraphs = breaksToParagraphs; window.__ppTest.liveEditorHtml = liveEditorHtml;
+    window.__ppTest.downloadMagicPortDash2 = downloadMagicPortDash2; window.__ppTest.collectTwoField = collectTwoField;
+    window.__ppTest.saveToDash5 = saveToDash5; window.__ppTest.d2CaptureMeta = d2CaptureMeta;
   } catch (e) {}
 
   // ---- boot ---------------------------------------------------------------
+  try { mpDash2Hosts(); } catch (e) {}   // read the manifest now: an orphaned script can't later
   askInterceptorForLatest();
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", ensureUI);

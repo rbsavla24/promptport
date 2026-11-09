@@ -34,6 +34,13 @@
     return new TextEncoder().encode(str);
   }
 
+  // MS-DOS time/date of every entry. 0/0 is an invalid date (month 0, day 0)
+  // that some unzip tools reject or show as garbage — use 1980-01-01 00:00,
+  // the earliest valid DOS date (date word 0x0021), so archives stay
+  // byte-identical for the same files.
+  var DOS_TIME = 0x0000;
+  var DOS_DATE = ((1980 - 1980) << 9) | (1 << 5) | 1;   // = 0x0021
+
   function u16(n) { return [n & 0xFF, (n >>> 8) & 0xFF]; }
   function u32(n) { return [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF]; }
 
@@ -59,7 +66,7 @@
         u16(20),           // version needed
         u16(0x0800),       // flags (bit 11 = UTF-8 filenames)
         u16(0),            // method = store
-        u16(0), u16(0),    // mod time, mod date (0)
+        u16(DOS_TIME), u16(DOS_DATE), // mod time, mod date
         u32(crc),
         u32(dataBytes.length), // compressed size
         u32(dataBytes.length), // uncompressed size
@@ -77,7 +84,7 @@
         u16(20),           // version needed
         u16(0x0800),       // flags (bit 11 = UTF-8 filenames)
         u16(0),            // method
-        u16(0), u16(0),    // time, date
+        u16(DOS_TIME), u16(DOS_DATE), // time, date
         u32(crc),
         u32(dataBytes.length),
         u32(dataBytes.length),
