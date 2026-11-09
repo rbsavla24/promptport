@@ -6,7 +6,7 @@
 
 Back up a bot in one click. Move a prompt between assistants or between platforms. Review every change before it touches the page.
 
-![Version](https://img.shields.io/badge/version-4.0.0-1a1a1a)
+![Version](https://img.shields.io/badge/version-4.1.3-1a1a1a)
 ![Chrome](https://img.shields.io/badge/Chrome-Manifest%20V3-1a1a1a)
 ![Privacy](https://img.shields.io/badge/data-never%20leaves%20your%20browser-1a1a1a)
 ![License](https://img.shields.io/badge/license-MIT-1a1a1a)
@@ -36,7 +36,7 @@ Prompt teams end up copy-pasting between tabs, losing formatting, breaking varia
 | Platform | Where it runs | What it reads and writes |
 | --- | --- | --- |
 | **5-field dashboard** | Assistant pages of the supported 5-field dashboard | 5 sections: First Message, Objective, Response Guidelines, Conversation Script, FAQs |
-| **2-field dashboard** | Voice-agent pages of the supported 2-field dashboard (production and QA) | 2 prompt fields: First Message, Main Prompt. With Magic Port also: custom variables, language, custom analysis, on-call tools and event subscriptions |
+| **2-field dashboard** | Voice-agent pages of the supported 2-field dashboard (production and QA) — both the original tabbed layout and the redesigned sidebar layout, detected automatically | 2 prompt fields: First Message, Main Prompt. With Magic Port also: custom variables, language & voice, models, call settings, custom analysis, pre-call and on-call tools and event subscriptions |
 
 The extension only activates on these two sites. It has no access to any other page.
 
@@ -89,21 +89,23 @@ flowchart LR
 
 ### Magic Port — move the whole bot, not just the prompt
 
-Everything above moves *prompt text*. **Magic Port** moves a bot's **configuration** as well: export a complete bot from a 5-field dashboard as a single ZIP, then import it into a bot on a 2-field dashboard.
+Everything above moves *prompt text*. **Magic Port** moves a bot's **configuration** as well: export a complete bot as a single ZIP — from a 5-field dashboard or from a 2-field dashboard — then import it into a bot on a 2-field dashboard.
 
 | What moves | Notes |
 | --- | --- |
 | **Prompt** (First Message, Main Prompt) | Travels as the same Markdown buckets the normal export uses |
-| **Custom variables** | Created on the destination. The source has no type on variables, so they arrive as `String` |
-| **Language** | Primary and secondary, mapped from locale codes to the destination's language names (`hi-IN` → Hindi) |
+| **Custom variables** | Created on the destination. From a 5-field source (no types there) they arrive as `String`; from a 2-field source they keep their types |
+| **Language & voice** | Primary and secondary language, mapped from locale codes to the destination's language names (`hi-IN` → Hindi). From a 2-field source, the voice and speaking speed too |
+| **Models and call settings** | From a 2-field source: LLM and speech-to-text provider/model, and the call settings (switches, timings, voicemail) |
 | **Custom analysis** | The system prompt plus the required keys, each with its type (`String` / `Number` / `Boolean` / `String[]`) |
-| **Tools** | On-call API tools: method, URL, headers, query, path and body rows, including variables bound through the picker |
+| **Tools** | Pre-call and on-call API tools: method, URL, headers, query, path and body rows, including variables bound through the picker |
 | **Event subscriptions** | Each webhook URL with its events |
 
 **What it does *not* move**, by design or by platform limit:
 
-- **Voice and speaking speed** are not ported — only the languages.
-- **Pre-call and post-call tools cannot be migrated.** The destination dashboard currently shows *"Coming soon."* for both phases and offers no way to add an API there, so a bot whose tools are all pre-call migrates zero tools. Every skipped tool is listed by name on the results screen rather than silently dropped. If the destination enables those phases, Magic Port will use them without needing a code change.
+- **Voice and speaking speed from a 5-field source** are not ported — only the languages. (From a 2-field source they are.)
+- **Post-call tools cannot be migrated yet.** The destination dashboard shows *"Coming soon"* for that phase. Every skipped tool is listed by name on the results screen rather than silently dropped.
+- **Analysis key defaults** can't be stored on the destination and are listed on the results screen.
 - **Non-API tools** — callback-schedule, calendar, form, quick-reply and WhatsApp widgets — have no equivalent on the destination and are reported as out of scope.
 
 **It adds; it does not delete.** Variables, tools and subscriptions already on the destination that the source doesn't have are left exactly where they are, and listed in the results so you can see the difference. Nothing is ever removed from the destination bot.
@@ -114,7 +116,7 @@ Everything above moves *prompt text*. **Magic Port** moves a bot's **configurati
 
 ```mermaid
 flowchart LR
-    R[Source bot · 5-field dashboard<br/>prompt + variables + tools<br/>+ analysis + webhooks] -- Magic Port export --> Z[(Single ZIP)]
+    R[Source bot · 5-field or 2-field dashboard<br/>prompt + variables + tools<br/>+ analysis + webhooks] -- Magic Port export --> Z[(Single ZIP)]
     Z -- Magic Port import --> V[Destination bot · 2-field dashboard<br/>configured to match]
 ```
 
@@ -135,11 +137,13 @@ flowchart LR
 
 PromptPort is a standard Chrome (Manifest V3) extension. It should also load in other Chromium browsers such as Edge and Brave (tested on Chrome).
 
-1. Download `PromptPort-v3.2.4.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
+1. Download `PromptPort-v4.1.3.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
    *(Or clone this repository and use the `extension` folder.)*
 2. Open `chrome://extensions` and switch on **Developer mode** (top right).
 3. Click **Load unpacked** and select the unzipped folder (the one containing `manifest.json`).
-4. Open an assistant on the 5-field dashboard, or a voice agent's Prompt tab on the 2-field dashboard. The PromptPort button appears in the bottom-right corner.
+4. Open an assistant on the 5-field dashboard, or a voice agent on the 2-field dashboard. The PromptPort button appears in the bottom-right corner.
+
+> **Already have an older PromptPort installed?** Version 4.1 is listed as *PromptPort 4.1*, its button carries a small "4.1" tag, and it runs in its own page container, so it can sit next to an older copy without either one interfering.
 
 > **Work laptop with managed extensions?** Ask your IT admin to allow the extension. The [permissions](#permissions) section below is written for them.
 
@@ -161,13 +165,13 @@ PromptPort is a standard Chrome (Manifest V3) extension. It should also load in 
 4. Check the page, then press **Save** on the site to keep the changes — or **Undo import** to go back.
 
 ### Magic Port
-1. On the 5-field dashboard, open the assistant you want to copy, open the panel and click **Magic Port**. You get one ZIP holding the prompt and the configuration.
+1. Open the bot you want to copy (5-field or 2-field dashboard), open the panel and click **Magic Port**. You get one ZIP holding the prompt and the configuration.
 2. On the 2-field dashboard, open the destination agent — ideally a **blank** one — and drop that ZIP into the **Import** tab.
-3. Read the summary: it lists what will be migrated and what won't (non-API tools, pre/post-call tools).
-4. Tick the consent box and confirm. Magic Port works through the agent's tabs, saving each section as it finishes.
+3. Read the summary: it lists what will be migrated and what won't (non-API tools, post-call tools).
+4. Tick the consent box and confirm. Magic Port works through the agent's sections, saving each one as it finishes. If the page already has unsaved edits or fields that need fixing, it stops first and asks you to save or discard them.
 5. Read the results screen. Anything it could not write is listed by name — nothing fails silently.
 
-> Unlike a prompt import, this one presses **Save** for you, and there is no one-click undo for configuration. Rehearse on a blank bot.
+> Unlike a prompt import, this one presses **Save** for you. **Undo import** restores the prompt fields only — there is no one-click undo for configuration. Rehearse on a blank bot. If the page is reloaded or the session expires mid-run, the panel shows what was done when you next open it.
 
 ### Find & replace
 1. Open the **Find** tab and type. Matches highlight as you type.
@@ -226,7 +230,6 @@ Writing files by hand? A line break you type stays a line break, and `@{{variabl
 | Permission | Why it's needed |
 | --- | --- |
 | `clipboardRead`, `clipboardWrite` | Copies each section exactly as the site's editor formats it (variables, tables, lists). Your clipboard is put back afterwards. |
-| `activeTab`, `scripting` | Lets the toolbar popup check the current page and open the panel. |
 | Host access to the supported dashboards (listed in `manifest.json`) | The only sites the extension runs on. A QA host is included so a migration can be rehearsed before touching production. |
 
 On the 5-field dashboard, a small page script notices the assistant data the dashboard already loads, which helps name your ZIP files. It only ever repeats read-only requests, never a save.
@@ -248,7 +251,7 @@ Yes. Chips export as `@{{name}}` and come back as real chips on import. Find & r
 Yes. Export a 5-bucket ZIP from the 5-field dashboard and import it on the 2-field dashboard. The sections are combined into Main Prompt under `#` headings. It works the other way too.
 
 **Can Magic Port copy my pre-call tools?**
-Not today, and not because of the extension. The destination dashboard shows *"Coming soon."* for both the Pre Call and Post Call phases and gives no way to add an API there, so those tools have nowhere to go. They are listed by name on the results screen so you know exactly what was left behind. When the destination enables those phases, Magic Port picks them up automatically.
+Yes — pre-call and on-call API tools are migrated (post-call tools are not yet supported by the destination dashboard and are listed by name on the results screen).
 
 **What happens if the destination bot already has variables or webhooks?**
 They stay. Magic Port adds and updates; it never deletes. Anything on the destination that isn't in the source is reported back to you as "left in place" so you can decide what to do with it.
@@ -270,14 +273,15 @@ No. There is no server, no analytics and no tracking. Everything happens in your
 - On the 5-field dashboard, re-importing a list can change its spacing class in the editor. The text and the exported Markdown are unaffected.
 - Collapsed sections on the 5-field dashboard are opened automatically before reading.
 - Magic Port reads back everything it writes and re-checks it, because the destination dashboard renders some lists a moment behind its own backend. Anything it could not confirm is named on the results screen instead of being reported as done.
-- Rehearse a migration on a blank bot first. Magic Port adds rather than replaces, so importing twice into the same bot is safe for tools and webhooks, but variables will accumulate.
+- Rehearse a migration on a blank bot first. Magic Port adds rather than replaces; running it twice on the same bot does not duplicate variables, tools or webhooks — they are reported as "already there".
+- Saves are only reported as done when the dashboard confirms them after the click; anything refused or unconfirmed is named on the results screen.
 
 ---
 
 ## Roadmap ideas
 
-- Magic Port in the 2-field → 5-field direction (today it is 5-field → 2-field only)
-- Porting voice and speaking speed alongside the languages
+- Magic Port in the 2-field → 5-field direction (today the destination is always a 2-field dashboard)
+- Porting voice and speaking speed from a 5-field source
 - One-click "compare two assistants"
 - Export history inside the panel
 - Firefox support
