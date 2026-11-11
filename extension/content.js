@@ -3334,7 +3334,7 @@
 .rs-row.rs-three{display:grid;grid-template-columns:1fr 1.35fr 1fr;gap:10px}
 .rs-btn svg{width:auto}
 .rs-ctas{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.rs-cta.rs-cta-wide{display:flex;width:100%;margin-top:12px;flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:center;gap:0 8px;min-height:36px;height:auto;padding:3px 14px}
+.rs-cta.rs-cta-wide{display:flex;width:100%;margin-top:12px;flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:center;gap:0 8px;min-height:41px;height:auto;padding:4px 14px}
 .rs-cta.rs-cta-wide svg{width:24px;height:19px;flex:none}
 .rs-cta{flex-direction:column;gap:4px;padding:12px 8px 10px;min-height:126px;background:var(--mist);color:var(--ink);box-shadow:3px 3px 0 var(--ink);font-size:13px}
 .rs-cta:nth-child(even){border-radius:var(--sk2)}
@@ -3457,10 +3457,10 @@
 .rs-dropzone:focus-visible,.rs-view-changes:focus-visible,.rs-linkic:focus-visible,.rs-check:focus-within,.rs-choice:focus-within{outline:2px solid var(--ink);outline-offset:2px}
 .rs-tab:focus-visible{outline-offset:2px;border-radius:var(--sk)}
 @media (max-height:620px){.rs-trust-t{display:none}.rs-cta{min-height:96px}.rs-cta svg{width:44px;height:34px}}
-@media (max-height:560px){.rs-cta:not(.rs-cta-wide){min-height:76px;padding:8px 6px 7px;gap:2px}.rs-cta:not(.rs-cta-wide) svg{width:32px;height:25px}.rs-cta.rs-cta-wide{min-height:32px;margin-top:8px}}
+@media (max-height:560px){.rs-cta:not(.rs-cta-wide){min-height:76px;padding:8px 6px 7px;gap:2px}.rs-cta:not(.rs-cta-wide) svg{width:32px;height:25px}.rs-cta.rs-cta-wide{min-height:37px;margin-top:8px}}
 @media (max-height:560px){.rs-panel{overflow-y:auto;overscroll-behavior:contain}.rs-panel>.rs-body{flex:none;overflow:visible}.rs-panel>.rs-foot{position:sticky;bottom:0;z-index:1}.rs-panel.rs-foot-free>.rs-foot{position:static}}
 @media (max-height:420px){.rs-panel .rs-foot{padding-top:7px;padding-bottom:7px}.rs-cta:not(.rs-cta-wide){min-height:40px}.rs-cta:not(.rs-cta-wide)::after{display:none}.rs-foot-meta .rs-textbtn{min-height:28px;padding:2px 8px}}
-@media (max-height:480px){.rs-phead{min-height:34px;padding-top:2px}.rs-x{width:36px;height:36px}.rs-tab{min-height:34px;padding:6px 4px 8px}.rs-foot{padding:9px 14px 9px}.rs-cta:not(.rs-cta-wide){min-height:48px;padding:6px 6px}.rs-cta:not(.rs-cta-wide) svg{display:none}.rs-cta.rs-cta-wide{min-height:30px;margin-top:6px}.rs-foot-meta{margin-top:2px}}
+@media (max-height:480px){.rs-phead{min-height:34px;padding-top:2px}.rs-x{width:36px;height:36px}.rs-tab{min-height:34px;padding:6px 4px 8px}.rs-foot{padding:9px 14px 9px}.rs-cta:not(.rs-cta-wide){min-height:48px;padding:6px 6px}.rs-cta:not(.rs-cta-wide) svg{display:none}.rs-cta.rs-cta-wide{min-height:35px;margin-top:6px}.rs-foot-meta{margin-top:2px}}
 /* ---- motion system: paper, ink and springs (all off under reduced-motion) ---- */
 :host{--rs-spring:cubic-bezier(.34,1.56,.64,1);--rs-out:cubic-bezier(.16,1,.3,1)}
 @keyframes rs-in{0%{opacity:0;transform:translate(22px,34px) scale(.8) rotate(3.5deg)}55%{opacity:1;transform:translate(-2px,-4px) scale(1.018) rotate(-.7deg)}78%{transform:translate(1px,1px) scale(.996) rotate(.25deg)}100%{opacity:1;transform:none}}
@@ -3502,27 +3502,47 @@
 .rs-btn-primary:not(:disabled):not([aria-disabled="true"]):hover,.rs-btn-danger:not(:disabled):hover{transform:translate(-2px,-2px);box-shadow:5px 5px 0 var(--steel)}
 .rs-btn-ghost:not(:disabled):hover{transform:translate(-1px,-1px)}
 .rs-btn:not(:disabled):not([aria-disabled="true"]):active,.rs-cta:not(:disabled):active{transform:translate(3px,3px) scale(.97,.94);box-shadow:0 0 0 var(--ink);transition-duration:.06s}
+/* press feedback that also shows on a quick trackpad tap or a key press (:active alone is too brief):
+   the button stamps into the paper (shadow collapses), its icon squashes, an ink ripple spreads from the
+   touch point, and on release it springs back past its rest position */
+.rs-btn,.rs-cta{position:relative;isolation:isolate}
+.rs-btn.rs-pressed,.rs-cta.rs-pressed{transform:translate(3px,3px) scale(.97,.94)!important;box-shadow:0 0 0 var(--ink)!important;transition-duration:.06s!important}
+.rs-cta.rs-cta-wide.rs-pressed{transform:translate(3px,3px) scale(.985,.9)!important}
+.rs-cta svg{transition:transform .25s var(--rs-spring)}
+.rs-cta.rs-pressed svg{transform:scale(.88,.84);transition-duration:.06s}
+.rs-panel .rs-btn.rs-popped,.rs-panel .rs-cta.rs-popped{animation:none}
+.rs-panel .rs-btn.rs-pop,.rs-panel .rs-cta.rs-pop{animation:rs-press-pop .46s var(--rs-spring)}
+.rs-panel .rs-cta.rs-cta-wide.rs-pop{animation:rs-press-pop-wide .46s var(--rs-spring)}
+@keyframes rs-press-pop{0%{transform:translate(3px,3px) scale(.97,.94)}55%{transform:translate(-1px,-2px) scale(1.02,1.04)}100%{transform:none}}
+@keyframes rs-press-pop-wide{0%{transform:translate(3px,3px) scale(.985,.9)}55%{transform:translate(-1px,-1px) scale(1.01,1.06)}100%{transform:none}}
+.rs-rip-wrap{position:absolute;inset:0;overflow:hidden;border-radius:inherit;pointer-events:none;z-index:-1}
+.rs-rip{position:absolute;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:currentColor;opacity:.22;transform:scale(0);animation:rs-rip .55s var(--rs-out) forwards}
+@keyframes rs-rip{to{transform:scale(var(--rs-rip-s,30));opacity:0}}
+/* a tile that is preparing its download: moving hatch, so "working" is visible at a glance */
+.rs-panel .rs-cta.rs-preparing{cursor:progress;background-image:repeating-linear-gradient(-45deg,rgba(0,0,0,.07) 0 6px,transparent 6px 12px);background-size:16.97px 16.97px;animation:rs-hatch .9s linear infinite}
+@keyframes rs-hatch{to{background-position:16.97px 0}}
+.rs-panel .rs-cta.rs-preparing.rs-pop{animation:rs-press-pop .46s var(--rs-spring),rs-hatch .9s linear infinite}
 .rs-btn.rs-shine::after{content:"";position:absolute;top:-10%;bottom:-10%;left:0;width:40%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);animation:rs-shine .75s var(--rs-out) forwards;pointer-events:none}
 /* download tiles: pages fan out like a hand of cards; Magic Port's cube hops and its arrow orbits */
 .rs-cta{transition:transform .3s var(--rs-spring),box-shadow .2s var(--rs-out),background .2s}
-.rs-cta:not(:disabled):hover{transform:translate(-2px,-3px) rotate(-.6deg);box-shadow:5px 6px 0 var(--ink)}
-.rs-cta:nth-child(even):not(:disabled):hover{transform:translate(-2px,-3px) rotate(.6deg)}
-.rs-cta.rs-cta-wide:not(:disabled):hover{transform:translate(-1px,-2px);box-shadow:4px 5px 0 var(--ink)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover{transform:translate(-2px,-3px) rotate(-.6deg);box-shadow:5px 6px 0 var(--ink)}
+.rs-cta:nth-child(even):not(:disabled):not([aria-disabled="true"]):hover{transform:translate(-2px,-3px) rotate(.6deg)}
+.rs-cta.rs-cta-wide:not(:disabled):not([aria-disabled="true"]):hover{transform:translate(-1px,-2px);box-shadow:4px 5px 0 var(--ink)}
 .rs-pg,.rs-pt,.rs-cube,.rs-orbit{transform-box:view-box;transition:transform .5s var(--rs-spring)}
 .rs-pg,.rs-pt{transform-origin:29px 46px}
-.rs-cta:not(:disabled):hover .rs-pg1{transform:translate(-7px,1px) rotate(-11deg)}
-.rs-cta:not(:disabled):hover .rs-pg2{transform:translate(-3.5px,-1px) rotate(-5.5deg)}
-.rs-cta:not(:disabled):hover .rs-pg3{transform:translateY(-4px)}
-.rs-cta:not(:disabled):hover .rs-pg4{transform:translate(3.5px,-1px) rotate(5.5deg)}
-.rs-cta:not(:disabled):hover .rs-pg5{transform:translate(7px,1px) rotate(11deg)}
-.rs-cta:not(:disabled):hover .rs-pt1{transform:translate(-6px,-1px) rotate(-10deg)}
-.rs-cta:not(:disabled):hover .rs-pt2{transform:translate(6px,-2px) rotate(8deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pg1{transform:translate(-7px,1px) rotate(-11deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pg2{transform:translate(-3.5px,-1px) rotate(-5.5deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pg3{transform:translateY(-4px)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pg4{transform:translate(3.5px,-1px) rotate(5.5deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pg5{transform:translate(7px,1px) rotate(11deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pt1{transform:translate(-6px,-1px) rotate(-10deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-pt2{transform:translate(6px,-2px) rotate(8deg)}
 .rs-cube,.rs-orbit{transform-origin:22px 26px}
 .rs-orbit{transition:transform .8s var(--rs-out)}
-.rs-cta:not(:disabled):hover .rs-cube{transform:translateY(-4px) rotate(-10deg) scale(1.06)}
-.rs-cta:not(:disabled):hover .rs-orbit{transform:rotate(360deg)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-cube{transform:translateY(-4px) rotate(-10deg) scale(1.06)}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-orbit{transform:rotate(360deg)}
 .rs-spark{transform-box:fill-box;transform-origin:center}
-.rs-cta:not(:disabled):hover .rs-spark{animation:rs-twinkle .7s var(--rs-out) .15s}
+.rs-cta:not(:disabled):not([aria-disabled="true"]):hover .rs-spark{animation:rs-twinkle .7s var(--rs-out) .15s}
 .rs-ctas>.rs-cta{animation:rs-rise .45s var(--rs-spring) backwards}
 .rs-ctas>.rs-cta:nth-child(2){animation-delay:.07s}
 .rs-cta-wide{animation:rs-rise .45s var(--rs-spring) .14s backwards}
@@ -3855,6 +3875,67 @@
     watchBody();
     try { new MutationObserver(function () { watchBody(); ppCoexistSync(); }).observe(document.documentElement, { childList: true }); } catch (e) {}
   }
+  // Press feedback for buttons and CTAs: a quick trackpad tap or a key press is
+  // too short for :active to show, so the pressed look is held for at least
+  // ~120 ms, then the button springs back (rs-pop). A ripple spreads from the
+  // touch point (the centre for keys). Purely visual; clicks are untouched.
+  function ppWirePress(root) {
+    var SEL = ".rs-btn,.rs-cta";
+    var cur = null, downAt = 0;
+    function usable(b) { return b && !b.disabled && b.getAttribute("aria-disabled") !== "true"; }
+    function ripple(b, x, y) {
+      if (reduceMotion()) return;
+      try {
+        var r = b.getBoundingClientRect();
+        var wrap = b.querySelector(":scope > .rs-rip-wrap");
+        if (!wrap) { wrap = document.createElement("span"); wrap.className = "rs-rip-wrap"; wrap.setAttribute("aria-hidden", "true"); b.insertBefore(wrap, b.firstChild); }
+        var dot = document.createElement("span"); dot.className = "rs-rip";
+        // the ripple layer sits inside the border: measure from the padding box
+        var px = x == null ? b.clientWidth / 2 : x - r.left - b.clientLeft, py = y == null ? b.clientHeight / 2 : y - r.top - b.clientTop;
+        dot.style.left = px + "px"; dot.style.top = py + "px";
+        var cw = b.clientWidth, ch = b.clientHeight;
+        var far = Math.max(Math.hypot(px, py), Math.hypot(cw - px, py), Math.hypot(px, ch - py), Math.hypot(cw - px, ch - py));
+        dot.style.setProperty("--rs-rip-s", String(Math.ceil(far / 5) + 1));
+        wrap.appendChild(dot);
+        setTimeout(function () { try { dot.remove(); if (!wrap.firstChild) wrap.remove(); } catch (e) {} }, 650);
+      } catch (e) {}
+    }
+    function press(b, x, y) {
+      if (!usable(b)) return;
+      if (cur && cur !== b) release(true);
+      cur = b; downAt = Date.now();
+      b._ppPress = (b._ppPress || 0) + 1;   // a newer press on this button voids its pending release / pop timers
+      b.classList.remove("rs-pop"); b.classList.add("rs-pressed");
+      ripple(b, x, y);
+    }
+    function release(now) {
+      var b = cur; if (!b) return;
+      cur = null;
+      var id = b._ppPress, wait = now ? 0 : Math.max(0, 120 - (Date.now() - downAt));
+      setTimeout(function () {
+        if (b._ppPress !== id) return;
+        b.classList.remove("rs-pressed");
+        if (reduceMotion() || !b.isConnected) return;
+        // rs-popped (animation:none) stays, so dropping rs-pop never replays the tile's entrance animation
+        void b.offsetWidth; b.classList.add("rs-popped", "rs-pop");
+        setTimeout(function () { if (b._ppPress === id) b.classList.remove("rs-pop"); }, 480);
+      }, wait);
+    }
+    root.addEventListener("pointerdown", function (e) {
+      if (e.button !== 0) return;
+      var b = e.target && e.target.closest && e.target.closest(SEL);
+      if (b) press(b, e.clientX, e.clientY);
+    }, true);
+    ["pointerup", "pointercancel"].forEach(function (ty) { root.addEventListener(ty, function () { release(false); }, true); });
+    window.addEventListener("pointerup", function () { release(false); }, true);
+    root.addEventListener("keydown", function (e) {
+      if ((e.key !== "Enter" && e.key !== " ") || e.repeat) return;
+      var b = e.target && e.target.closest && e.target.closest(SEL);
+      if (b && b === e.target) { press(b, null, null); if (e.key === "Enter") release(false); }
+    }, true);
+    window.addEventListener("keyup", function (e) { if (e.key === " ") release(false); }, true);
+    root.addEventListener("focusout", function (e) { if (cur && e.target === cur) release(false); }, true);
+  }
   function ensureHost() {
     // The page took our host out (and keepHost backed off for now): every use
     // of the UI puts it back under <html>.
@@ -3882,6 +3963,7 @@
     // A page zoom set on <html> without a resize (style / class change) too.
     try { new MutationObserver(syncZoom).observe(document.documentElement, { attributes: true, attributeFilter: ["style", "class"] }); } catch (e) {}
     ppCoexistWatch();
+    ppWirePress(root);
     root.addEventListener("pointerdown", function (e) {
       try {
         var t = e.target && e.target.closest && e.target.closest(".rs-btn,.rs-cta,.rs-tab,.rs-launcher,.rs-check,.rs-linkic,.rs-dropzone,.rs-textbtn,.rs-x,.rs-choice");
@@ -5445,6 +5527,7 @@
     tiles.forEach(function (b) {
       b.setAttribute("aria-label", focusName(b));   // keeps its name, so the repaint after puts focus back on it
       b.setAttribute("aria-disabled", "true"); b.setAttribute("data-sub", "");
+      b.classList.add("rs-preparing");
       var l = b.querySelector(".rs-cta-l"); if (l) l.textContent = "Preparing…";
     });
     [].forEach.call(UI.foot.querySelectorAll(".rs-foot-meta .rs-textbtn"), function (b) { b.setAttribute("aria-disabled", "true"); });
@@ -5637,6 +5720,7 @@
       var b = el("button", "rs-btn rs-cta");
       b.innerHTML = art;
       b.appendChild(el("span", "rs-cta-l", enabled ? label : "Preparing…"));
+      if (!enabled) b.classList.add("rs-preparing");
       b.setAttribute("data-sub", enabled ? sub : "");
       b.disabled = !enabled || !canUse;
       if (enabled && !canUse && why) { b.title = why; }
@@ -5676,6 +5760,7 @@
       var mpBtn = el("button", "rs-btn rs-cta rs-cta-magic rs-cta-wide");
       mpBtn.innerHTML = IC.magic;
       mpBtn.appendChild(el("span", "rs-cta-l", enabled ? "Magic Port" : "Preparing…"));
+      if (!enabled) mpBtn.classList.add("rs-preparing");
       mpBtn.setAttribute("data-sub", enabled ? "· full bot: prompt + configs" : "");
       mpBtn.disabled = !enabled;
       mpBtn.title = "Download the entire bot (prompt, variables, language/voice, analysis, tools, event subscriptions) as one ZIP to import onto another bot.";
