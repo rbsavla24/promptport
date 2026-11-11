@@ -6,7 +6,7 @@
 
 Back up a bot in one click. Move a prompt between assistants or between platforms. Review every change before it touches the page.
 
-![Version](https://img.shields.io/badge/version-4.1.3-1a1a1a)
+![Version](https://img.shields.io/badge/version-4.1.4-1a1a1a)
 ![Chrome](https://img.shields.io/badge/Chrome-Manifest%20V3-1a1a1a)
 ![Privacy](https://img.shields.io/badge/data-never%20leaves%20your%20browser-1a1a1a)
 ![License](https://img.shields.io/badge/license-MIT-1a1a1a)
@@ -137,7 +137,7 @@ flowchart LR
 
 PromptPort is a standard Chrome (Manifest V3) extension. It should also load in other Chromium browsers such as Edge and Brave (tested on Chrome).
 
-1. Download `PromptPort-v4.1.3.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
+1. Download `PromptPort-v4.1.4.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
    *(Or clone this repository and use the `extension` folder.)*
 2. Open `chrome://extensions` and switch on **Developer mode** (top right).
 3. Click **Load unpacked** and select the unzipped folder (the one containing `manifest.json`).
