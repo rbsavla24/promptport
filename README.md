@@ -6,7 +6,7 @@
 
 Back up a bot in one click. Move a prompt between assistants or between platforms. Review every change before it touches the page.
 
-![Version](https://img.shields.io/badge/version-4.1.4-1a1a1a)
+![Version](https://img.shields.io/badge/version-4.2.1-1a1a1a)
 ![Chrome](https://img.shields.io/badge/Chrome-Manifest%20V3-1a1a1a)
 ![Privacy](https://img.shields.io/badge/data-never%20leaves%20your%20browser-1a1a1a)
 ![License](https://img.shields.io/badge/license-MIT-1a1a1a)
@@ -137,13 +137,13 @@ flowchart LR
 
 PromptPort is a standard Chrome (Manifest V3) extension. It should also load in other Chromium browsers such as Edge and Brave (tested on Chrome).
 
-1. Download `PromptPort-v4.1.4.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
+1. Download `PromptPort-v4.2.1.zip` from [**Releases**](../../releases/latest) and unzip it into a folder you'll keep.
    *(Or clone this repository and use the `extension` folder.)*
 2. Open `chrome://extensions` and switch on **Developer mode** (top right).
 3. Click **Load unpacked** and select the unzipped folder (the one containing `manifest.json`).
 4. Open an assistant on the 5-field dashboard, or a voice agent on the 2-field dashboard. The PromptPort button appears in the bottom-right corner.
 
-> **Already have an older PromptPort installed?** Version 4.1 is listed as *PromptPort 4.1*, its button carries a small "4.1" tag, and it runs in its own page container, so it can sit next to an older copy without either one interfering.
+> **Already have an older PromptPort installed?** This version is listed as *PromptPort 4.2*, its button carries a small tag with the full version (for example "v4.2.1"), and it runs in its own page container, so it can sit next to an older copy without either one interfering.
 
 > **Work laptop with managed extensions?** Ask your IT admin to allow the extension. The [permissions](#permissions) section below is written for them.
 
