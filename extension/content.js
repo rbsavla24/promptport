@@ -4055,9 +4055,9 @@
     try { if (UI.host && !UI.host.isConnected && document.documentElement) document.documentElement.appendChild(UI.host); } catch (e) {}
     if (UI.launcher) return;
     var b = el("button", "rs-launcher");
-    b.innerHTML = IC.star + '<span class="rs-badge"></span><span class="rs-ver" aria-hidden="true">4.1</span>';
-    b.title = "PromptPort 4.1";
-    b.setAttribute("aria-label", "PromptPort 4.1");
+    b.innerHTML = IC.star + '<span class="rs-badge"></span><span class="rs-ver" aria-hidden="true">' + esc("v" + PP_VERSION) + '</span>';
+    b.title = "PromptPort v" + PP_VERSION;
+    b.setAttribute("aria-label", "PromptPort v" + PP_VERSION);
     b.setAttribute("aria-expanded", "false");
     UI.badge = b.querySelector(".rs-badge");
     var lastPtr = "", ptrAt = 0, kbDown = false;
@@ -4141,7 +4141,7 @@
     var fWas = fEl ? (fEl === UI._fbEl && UI._fbWant) || { tag: fEl.tagName, name: focusName(fEl), tab: fEl.classList.contains("rs-tab") } : null;
     if (wasOpen) UI.card.parentNode.removeChild(UI.card);
     var card = el("div", "rs-panel " + (wasOpen ? "rs-swap" : "rs-enter") + (wasOpen && tabChanged && prevIdx >= 0 && newIdx >= 0 ? (newIdx > prevIdx ? " rs-dir-r" : " rs-dir-l") : "")); UI.card = card;
-    card.setAttribute("role", "dialog"); card.setAttribute("aria-label", "PromptPort 4.1");
+    card.setAttribute("role", "dialog"); card.setAttribute("aria-label", "PromptPort v" + PP_VERSION);
     if (UI.launcher) UI.launcher.setAttribute("aria-expanded", "true");
 
     var top = el("div", "rs-top");

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "PromptPort 4.1",
-  "version": "4.1.4",
+  "name": "PromptPort 4.2",
+  "version": "4.2.1",
   "description": "Export and import voice-bot prompts as markdown ZIPs (5 buckets or 2 buckets), plus Magic Port — migrate a full bot (prompt + configurations) from a 5-field dashboard to a 2-field dashboard.",
   "permissions": [
     "clipboardRead",
